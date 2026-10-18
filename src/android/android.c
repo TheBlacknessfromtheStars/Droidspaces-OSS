@@ -98,10 +98,11 @@ void android_remount_data_suid(void) {
   /* On some Android versions, /data is mounted nosuid. We need suid for
    * sudo/su/ping within the container if it's stored on /data. */
   char *args[] = {"mount", "-o", "remount,suid", "/data", NULL};
-  if (run_command_quiet(args) != 0) {
-    ds_warn(
-        "Failed to remount /data with suid support. su/sudo might not work.");
-  }
+  int rc = run_command_quiet(args);
+  if (rc != 0)
+    ds_warn("Failed to remount /data with suid support (mount exited %d). "
+            "su/sudo might not work.",
+            rc);
 }
 
 /* Storage */

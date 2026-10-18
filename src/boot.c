@@ -253,6 +253,20 @@ int internal_boot(struct ds_config *cfg) {
     goto boot_fail;
   }
 
+  /* 4a. Directory rootfs on Android: a bind inherits MS_NOSUID from the mount
+   * it copies, and Android mounts /data nosuid in some namespaces.  Every
+   * setuid binary in the container then fails (sudo, su, passwd, ping), which
+   * looks like a broken image and is not.  Clear the flag here, in the
+   * namespace pivot_root hands to the container, rather than depending on the
+   * parent's /data remount in start_rootfs(): that runs after this fork, so it
+   * races against this bind and loses whenever the bind gets there first. */
+  if (is_android() && !cfg->is_img_mount && !cfg->volatile_mode) {
+    if (mount(NULL, cfg->rootfs_path, NULL,
+              MS_REMOUNT | MS_NOATIME | MS_NODIRATIME, NULL) < 0)
+      ds_warn("Failed to clear nosuid on rootfs %s: %s", cfg->rootfs_path,
+              strerror(errno));
+  }
+
   /* 4b. Force the image rootfs read-write - the single unified point covering
    * fresh boot, restart, AND internal reboot.
    *

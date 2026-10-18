@@ -1,0 +1,71 @@
+name: suid-fix build
+
+# Builds this branch (aarch64 backend + APK) and publishes both to a Release.
+# Re-runs update the same release, so the download links stay stable.
+
+on:
+  push:
+    branches: [ "fix/directory-rootfs-nosuid" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential wget zstd
+
+      - name: Fetch aarch64 musl toolchain
+        run: |
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          wget -q "https://github.com/ravindu644/Droidspaces-OSS/releases/download/compilers-25843896720/aarch64-linux-musl-cross.tar.zst"
+          tar -xf aarch64-linux-musl-cross.tar.zst
+          ls "$HOME/toolchains"
+
+      - name: Build backend (aarch64, static)
+        run: make aarch64
+
+      - name: Stage backend into the APK assets
+        run: cp -f output/droidspaces Android/app/src/main/assets/binaries/droidspaces-aarch64
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Build APK (debug signed)
+        run: |
+          cd Android
+          chmod +x gradlew
+          ./gradlew --no-daemon --console=plain assembleDebug
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: suid-fix-build
+          name: Droidspaces suid fix build
+          body: |
+            Build of `fix/directory-rootfs-nosuid`: clear MS_NOSUID on a directory
+            rootfs right after the self-bind, in the namespace pivot_root hands to
+            the container.
+
+            Directory rootfs containers previously inherited MS_NOSUID from /data and
+            then could not run any setuid binary (sudo, su, passwd, ping). The only
+            countermeasure ran in the parent after the monitor fork, so it raced the
+            child's bind and lost whenever the bind got there first.
+
+            Assets:
+            - droidspaces: aarch64 static backend with the fix
+            - app-debug.apk: debug-signed APK that ships the same backend in assets
+          files: |
+            output/droidspaces
+            Android/app/build/outputs/apk/debug/app-debug.apk
