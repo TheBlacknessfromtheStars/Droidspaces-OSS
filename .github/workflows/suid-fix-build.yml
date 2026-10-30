@@ -48,6 +48,19 @@ jobs:
           done
           ls "$HOME/toolchains"
 
+      # Same secret names the upstream CI uses. Empty means the APK is signed
+      # with a throwaway key, which cannot update an installed build.
+      - name: Decode signing keystore
+        env:
+          RELEASE_KEYSTORE: ${{ secrets.RELEASE_KEYSTORE }}
+        run: |
+          if [ -n "$RELEASE_KEYSTORE" ]; then
+            echo "$RELEASE_KEYSTORE" | base64 -d > droidspaces.keystore
+            echo "Keystore decoded. The APK will be signed with it."
+          else
+            echo "::warning::RELEASE_KEYSTORE is empty, the APK gets a throwaway key and will not update an installed build."
+          fi
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -56,11 +69,21 @@ jobs:
 
       # buildBackend compiles the four phone arches and backendAssets copies them
       # into the APK, so this one command produces both artifacts.
-      - name: Build APK (debug signed)
+      - name: Build APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           cd Android
           chmod +x gradlew
-          ./gradlew --no-daemon --console=plain assembleDebug
+          ARGS=()
+          if [ -n "$KEYSTORE_PASSWORD" ]; then
+            ARGS+=("-PKEYSTORE_PASSWORD=$KEYSTORE_PASSWORD")
+            ARGS+=("-PKEY_ALIAS=${KEY_ALIAS:-droidspaces}")
+            ARGS+=("-PKEY_PASSWORD=${KEY_PASSWORD:-$KEYSTORE_PASSWORD}")
+          fi
+          ./gradlew --no-daemon --console=plain assembleDebug "${ARGS[@]}"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
