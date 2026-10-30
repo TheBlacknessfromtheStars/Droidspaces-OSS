@@ -1,6 +1,6 @@
 name: suid-fix build
 
-# Builds this branch (aarch64 backend + APK) and publishes both to a Release.
+# Builds this branch and publishes the backend and the APK to a Release.
 # Re-runs update the same release, so the download links stay stable.
 
 on:
@@ -10,6 +10,10 @@ on:
 
 permissions:
   contents: write
+
+env:
+  # Same toolchain release the upstream CI uses.
+  TOOLCHAINS_URL: https://github.com/ravindu644/Droidspaces-OSS/releases/download/compilers-25843896720
 
 jobs:
   build:
@@ -22,26 +26,36 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y build-essential wget zstd
 
-      - name: Fetch aarch64 musl toolchain
+      # The release URL names a fixed set of toolchains, so it is the whole key
+      - name: Cache toolchains
+        id: toolchains
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains
+          key: musl-toolchains-${{ env.TOOLCHAINS_URL }}
+
+      # The app's own :app:buildBackend task runs `make aarch64 armhf x86_64 x86`,
+      # so all four cross compilers have to be present before Gradle starts.
+      - name: Download phone toolchains
+        if: steps.toolchains.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$HOME/toolchains"
           cd "$HOME/toolchains"
-          wget -q "https://github.com/ravindu644/Droidspaces-OSS/releases/download/compilers-25843896720/aarch64-linux-musl-cross.tar.zst"
-          tar -xf aarch64-linux-musl-cross.tar.zst
+          for t in aarch64-linux-musl arm-linux-musleabihf i686-linux-musl x86_64-linux-musl; do
+            echo "[*] Downloading $t"
+            wget -q "$TOOLCHAINS_URL/$t-cross.tar.zst"
+            tar -xf "$t-cross.tar.zst" && rm -f "$t-cross.tar.zst"
+          done
           ls "$HOME/toolchains"
 
-      - name: Build backend (aarch64, static)
-        run: make aarch64
-
-      - name: Stage backend into the APK assets
-        run: cp -f output/droidspaces Android/app/src/main/assets/binaries/droidspaces-aarch64
-
-      - name: Set up JDK 21
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: '17'
 
+      # buildBackend compiles the four phone arches and backendAssets copies them
+      # into the APK, so this one command produces both artifacts.
       - name: Build APK (debug signed)
         run: |
           cd Android
@@ -64,8 +78,11 @@ jobs:
             child's bind and lost whenever the bind got there first.
 
             Assets:
-            - droidspaces: aarch64 static backend with the fix
-            - app-debug.apk: debug-signed APK that ships the same backend in assets
+            - droidspaces-aarch64: aarch64 static backend with the fix
+            - app-debug.apk: debug-signed APK that ships the same backends in assets
           files: |
-            output/droidspaces
+            output/droidspaces-aarch64
+            output/droidspaces-armhf
+            output/droidspaces-x86_64
+            output/droidspaces-x86
             Android/app/build/outputs/apk/debug/app-debug.apk
