@@ -22,9 +22,6 @@
  */
 
 #include "droidspace.h"
-#ifdef DS_ENABLE_SOCKETD_BACKEND
-#include "socketd_bridge.h"
-#endif
 
 #include <arpa/inet.h>
 #include <grp.h>
@@ -141,7 +138,6 @@ static void daemon_log_tee(const char *prefix, const char *fmt, ...) {
  * without restarting the daemon.
  */
 static char g_self_path[PATH_MAX];
-static volatile sig_atomic_t g_sigusr2_received = 0;
 
 /* wire protocol helpers */
 
@@ -309,7 +305,7 @@ static void handle_session(int conn, ds_req_t *r) {
   char buf[DS_IOBUF];
 
   if (is_pty) {
-    if (ds_openpty(&master, &slave, NULL) < 0) {
+    if (ds_openpty("/dev/ptmx", &master, &slave, NULL) < 0) {
       send_frame(conn, MSG_ERR, "daemon: openpty failed\n", 23);
       send_exit(conn, 1);
       return;
@@ -771,24 +767,22 @@ static void handle_conn(int conn) {
   }
 
   /*
-   * Block recursive daemon/client invocations.
-   * We skip any argv[i] whose predecessor starts with '-', because that arg
-   * is an option VALUE (e.g. --name daemon-container), not a sub-command.
-   * DS_NO_PROXY=1 is the primary guard (set before reexec); this is a
-   * defence-in-depth check.
+   * Everything after the command word belongs to that command, run's command
+   * line and enter's user included, so only the word itself can start a
+   * daemon or client recursion. It is found the way the client found it,
+   * with the option table, so a flag without a value (--stdin run daemon)
+   * cannot shift it. DS_NO_PROXY=1 is the primary guard (set before reexec);
+   * this is defence-in-depth.
    */
-  for (int i = 0; i < req.argc; i++) {
-    /* If the previous token was an option flag, this token is its value. */
-    if (i > 0 && req.argv[i - 1][0] == '-')
-      continue;
-    if (strcmp(req.argv[i], "daemon") == 0 ||
-        strcmp(req.argv[i], "client") == 0) {
-      send_frame(conn, MSG_ERR, "daemon: recursive call refused\n", 31);
-      send_exit(conn, 1);
-      free_req(&req);
-      close(conn);
-      _exit(1);
-    }
+  char **av = make_exec_argv(&req);
+  const char *cmd = av ? ds_command_word(req.argc + 1, av) : NULL;
+  free(av);
+  if (cmd && (strcmp(cmd, "daemon") == 0 || strcmp(cmd, "client") == 0)) {
+    send_frame(conn, MSG_ERR, "daemon: recursive call refused\n", 31);
+    send_exit(conn, 1);
+    free_req(&req);
+    close(conn);
+    _exit(1);
   }
 
   /* log the request */
@@ -901,10 +895,11 @@ static void daemonize(int foreground) {
   ds_oom_protect();
 }
 
-static void sigusr2_handler(int sig) {
-  (void)sig;
-  g_sigusr2_received = 1;
-}
+/* The app sends SIGUSR2 after a live binary swap. New sessions pick the new
+ * binary up on their own, so the signal only must not kill the daemon. Not
+ * SIG_IGN: that survives execve and would reach every command the daemon
+ * runs on a client's behalf. */
+static void sigusr2_handler(int sig) { (void)sig; }
 
 /*
  * ds_selinux_transition - re-exec into the droidspacesd SELinux domain.
@@ -1036,14 +1031,7 @@ int ds_daemon_run(int foreground, char **argv) {
       g_self_path[0] = '\0'; /* reexec() will fall back gracefully */
   }
 
-  /* SIGUSR2: app sends this after a live binary swap as an acknowledgment */
   signal(SIGUSR2, sigusr2_handler);
-
-#ifdef DS_ENABLE_SOCKETD_BACKEND
-  if (ds_socketd_bridge_start() < 0)
-    ds_warn("Failed to start droidspaces-socketd backend bridge: %s",
-            strerror(errno));
-#endif
 
   /* Write PID file so the Android app can signal us.  The daemon runs with
    * umask 0, so create it 0644 explicitly (not the fopen default 0666): a
@@ -1101,13 +1089,6 @@ int ds_daemon_run(int foreground, char **argv) {
   for (;;) {
     /* Rotate log if it exceeds 4MB */
     rotate_daemon_log_if_needed();
-
-    /* Acknowledge a live binary swap signalled by the Android app. */
-    if (g_sigusr2_received) {
-      g_sigusr2_received = 0;
-      ds_log("Binary updated on disk (SIGUSR2). New sessions will use updated "
-             "binary automatically.");
-    }
 
     int conn = accept4(srv, NULL, NULL, SOCK_CLOEXEC);
     if (conn < 0) {

@@ -9,7 +9,7 @@
 #include <linux/loop.h>
 
 #define DS_VTTY_COUNT                                                          \
-  6 /* /dev/tty1..6: masked in hw mode, null symlinks otherwise */
+  6 /* /dev/tty1..6: masked in hw mode, null device nodes otherwise */
 
 /* Forward declarations for loop helpers used in find_available_mountpoint */
 static void loop_detach(const char *loop_dev);
@@ -106,21 +106,6 @@ int domount(const char *src, const char *tgt, const char *fstype,
     if (errno != EBUSY) {
       ds_error("Failed to mount %s on %s (%s): %s", src ? src : "none", tgt,
                fstype ? fstype : "none", strerror(errno));
-      return -1;
-    }
-  }
-  return 0;
-}
-
-/* Like domount but logs failures at [DEBUG] level - used for best-effort
- * mounts where failure is expected on some environments (e.g. cgroup
- * bind-mounts on ROMs with non-standard controller paths). */
-int domount_silent(const char *src, const char *tgt, const char *fstype,
-                   unsigned long flags, const char *data) {
-  if (mount(src, tgt, fstype, flags, data) < 0) {
-    if (errno != EBUSY) {
-      ds_log("[DEBUG] mount %s -> %s failed: %s", src ? src : "none",
-             tgt ? tgt : "none", strerror(errno));
       return -1;
     }
   }
@@ -523,15 +508,18 @@ int create_devices(const char *rootfs, const char *staging) {
     }
   }
 
-  /* Private tmpfs only: tty1..N as /dev/null symlinks so non-systemd inits
-   * (openrc, busybox) stop logging "can't open /dev/ttyN"; agetty opens
-   * /dev/null and exits cleanly.  hw mode masks the real VTs in setup_dev(). */
+  /* Private tmpfs only: tty1..N as their own 1:3 (null) nodes so non-systemd
+   * inits (openrc, busybox) stop logging "can't open /dev/ttyN" and their
+   * getty has a tty to own. Never symlinks to /dev/null: getty fchmods its
+   * tty to 0620 root:tty, and through a symlink that lands on /dev/null
+   * itself, the host's own node when it had to be bind-mounted above. Where
+   * mknod is refused the VT stays absent, which only costs a log line. hw
+   * mode masks the real VTs in setup_dev(). */
   for (int i = 1; !staging && i <= DS_VTTY_COUNT; i++) {
     snprintf(path, sizeof(path), "%s/tty%d", dev_dir, i);
     force_unlink(path);
-    if (symlink("/dev/null", path) < 0) {
-      /* best-effort, ignore */
-    }
+    if (mknod(path, S_IFCHR | 0666, makedev(1, 3)) == 0)
+      chmod(path, 0666); /* the umask of a direct start would land on it */
   }
 
   /* Standard symlinks.  A symlink cannot be bind-mounted, so in hw mode these
@@ -571,13 +559,8 @@ int setup_devpts(int hw_access) {
   snprintf(optbuf, sizeof(optbuf), "gid=%d,newinstance,ptmxmode=0666,mode=0620",
            DS_DEFAULT_TTY_GID);
 
-  char optbuf2[128];
-  snprintf(optbuf2, sizeof(optbuf2), "gid=%d,newinstance,mode=0620",
-           DS_DEFAULT_TTY_GID);
-
-  const char *opts[] = {optbuf,        "newinstance,ptmxmode=0666,mode=0620",
-                        optbuf2,       "newinstance,ptmxmode=0666",
-                        "newinstance", NULL};
+  /* The gid-less retry is LXC's, for a kernel that refuses the option. */
+  const char *opts[] = {optbuf, "newinstance,ptmxmode=0666,mode=0620", NULL};
 
   for (int i = 0; opts[i]; i++) {
     if (domount("devpts", pts_path, "devpts", MS_NOSUID | MS_NOEXEC, opts[i]) ==
@@ -1241,33 +1224,5 @@ int unmount_rootfs_img(const char *mount_point, int silent) {
       ds_warn("Cleanup warning: %s is still busy/mounted.", mount_point);
   }
 
-  return 0;
-}
-
-/* Ensure host devpts is mounted - specifically for Android Recovery
- * environments where /dev/pts is often missing or unmounted, causing openpty()
- * to fail. */
-int ds_fix_host_ptys(void) {
-  const char *pts_path = "/dev/pts";
-
-  /* If already a mountpoint, we are good */
-  if (is_mountpoint(pts_path))
-    return 0;
-
-  /* Ensure directory exists */
-  mkdir(pts_path, 0755);
-
-  /* Mount host devpts. We use standard gid=5 (tty) and mode=620.
-   * This is the 'host' global namespace version of setup_devpts. */
-  if (mount("devpts", pts_path, "devpts", MS_NOSUID | MS_NOEXEC,
-            "gid=5,mode=620") < 0) {
-    if (errno != EBUSY) {
-      /* EBUSY means already mounted (redundant with is_mountpoint but safe) */
-      ds_warn("Failed to mount host devpts: %s", strerror(errno));
-      return -1;
-    }
-  }
-
-  ds_log("Host devpts mounted successfully (Recovery fix).");
   return 0;
 }

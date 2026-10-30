@@ -11,7 +11,7 @@ import org.json.JSONObject
 
 /**
  * Live container status (OS name, hostname, IP, uptime, CPU, RAM) from one
- * `show --format` call, with in-memory and persistent caching so cards render
+ * `show --json` call, with in-memory and persistent caching so cards render
  * instantly on the next app start.
  */
 object ContainerOSInfoManager {
@@ -28,7 +28,7 @@ object ContainerOSInfoManager {
     private var context: Context? = null
 
     /**
-     * One container's status as reported by `show --format`.
+     * One container's status as reported by `show --json`.
      */
     data class OSInfo(
         val prettyName: String?,
@@ -44,7 +44,9 @@ object ContainerOSInfoManager {
         val ramPercent: Double? = null,
         /** The memory limit in force. Null when unlimited, and then [ramPercent] is of the host's RAM. */
         val ramLimitKb: Long? = null,
-        val anlandSocket: String? = null
+        val anlandSocket: String? = null,
+        /** Booted with Termux:X11, from the boot snapshot like [anlandSocket]. */
+        val x11: Boolean = false
     ) {
         /** "13.50 MB / 1.50 GB (1%)" under a limit, "13.50 MB (0.2%)" of the host without one.
          * Each side picks its own unit, the way fastfetch prints memory. */
@@ -93,7 +95,7 @@ object ContainerOSInfoManager {
     }
 
     /**
-     * One `show --format` round trip: live status of every running container, keyed by
+     * One `show --json` round trip: live status of every running container, keyed by
      * name. A container missing from the result is not running.
      */
     suspend fun fetchAll(appContext: Context): Map<String, OSInfo> = withContext(Dispatchers.IO) {
@@ -138,6 +140,7 @@ object ContainerOSInfoManager {
             hostname = obj.optString("hostname").ifEmpty { null },
             ipAddress = obj.optString("ip").ifEmpty { null },
             anlandSocket = obj.optString("anland_sock").ifEmpty { null },
+            x11 = obj.optInt("x11") == 1,
             uptime = obj.optString("uptime").ifEmpty { null },
             cpuUsage = (if (cpuLimitPermill > 0) cpuPermill * 100.0 / cpuLimitPermill else cpuPermill / 10.0).coerceIn(0.0, 100.0),
             ramUsedKb = if (ramTotalKb > 0) ramUsedKb else null,
@@ -169,73 +172,18 @@ object ContainerOSInfoManager {
         return null
     }
 
-    /**
-     * Clear cache for a specific container or all containers.
-     * Clears both in-memory and persistent cache.
-     */
-    fun clearCache(containerName: String? = null, appContext: Context? = null) {
-        val ctx = appContext ?: context
-        if (containerName != null) {
-            cache.remove(containerName)
-            if (ctx != null) {
-                PreferencesManager.getInstance(ctx).clearContainerOSInfo(containerName)
-            }
-        } else {
-            cache.clear()
-            // Note: Clearing all persistent cache would require tracking all container names
-            // For now, just clear in-memory cache. Individual containers can be cleared by name.
-        }
+    /** Forgets one container, in memory and in the persistent cache. */
+    fun clearCache(containerName: String, appContext: Context? = null) {
+        cache.remove(containerName)
+        (appContext ?: context)?.let { PreferencesManager.getInstance(it).clearContainerOSInfo(containerName) }
     }
 
-    /**
-     * Parse /etc/os-release output.
-     */
+    /** KEY=value lines, quotes stripped; the five fields the card shows. */
     private fun parseOSRelease(output: List<String>): OSInfo {
-        var prettyName: String? = null
-        var name: String? = null
-        var version: String? = null
-        var versionId: String? = null
-        var id: String? = null
-
-        for (line in output) {
-            val trimmed = line.trim()
-            when {
-                trimmed.startsWith("PRETTY_NAME=") -> {
-                    prettyName = extractValue(trimmed.substringAfter("="))
-                }
-                trimmed.startsWith("NAME=") -> {
-                    name = extractValue(trimmed.substringAfter("="))
-                }
-                trimmed.startsWith("VERSION=") -> {
-                    version = extractValue(trimmed.substringAfter("="))
-                }
-                trimmed.startsWith("VERSION_ID=") -> {
-                    versionId = extractValue(trimmed.substringAfter("="))
-                }
-                trimmed.startsWith("ID=") -> {
-                    id = extractValue(trimmed.substringAfter("="))
-                }
-            }
+        val kv = output.filter { "=" in it }.associate {
+            it.substringBefore("=").trim() to
+                it.substringAfter("=").trim().removeSurrounding("\"").removeSurrounding("'").ifEmpty { null }
         }
-
-        return OSInfo(prettyName, name, version, versionId, id, null, null, null)
-    }
-
-    /**
-     * Extract and clean value from os-release line (removes quotes, whitespace).
-     */
-    private fun extractValue(value: String): String? {
-        if (value.isEmpty()) return null
-
-        var cleaned = value.trim()
-        // Remove surrounding quotes
-        if (cleaned.startsWith("\"") && cleaned.endsWith("\"")) {
-            cleaned = cleaned.substring(1, cleaned.length - 1)
-        }
-        if (cleaned.startsWith("'") && cleaned.endsWith("'")) {
-            cleaned = cleaned.substring(1, cleaned.length - 1)
-        }
-
-        return cleaned.takeIf { it.isNotEmpty() }
+        return OSInfo(kv["PRETTY_NAME"], kv["NAME"], kv["VERSION"], kv["VERSION_ID"], kv["ID"], null, null, null)
     }
 }

@@ -9,6 +9,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.rememberVectorPainter
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -29,15 +31,15 @@ import com.droidspaces.app.ui.util.rememberAnimatedEntries
 import com.droidspaces.app.ui.viewmodel.ContainerViewModel
 import com.droidspaces.app.ui.viewmodel.SystemStatsViewModel
 import com.droidspaces.app.util.AnlandUtils
+import com.droidspaces.app.util.TermuxX11Utils
 import androidx.compose.ui.platform.LocalContext
 import com.droidspaces.app.R
 
 /**
  * Control Panel screen - shows system stats and running containers.
  *
- * Note: This screen does NOT have its own PullToRefreshWrapper.
- * The parent ControlPanelTabContent provides the pull-to-refresh functionality.
- * This prevents double-wrapping issues that can cause UI glitches.
+ * No PullToRefreshWrapper of its own: MainTabScreen's pager wraps it, and a
+ * second wrapper inside the first glitches the gesture.
  */
 @Composable
 fun ControlPanelScreen(
@@ -109,9 +111,14 @@ fun ControlPanelScreen(
                     ) {
                         entries.forEach { entry ->
                             val container = entry.item
-                            // The heartbeat reports the broker's socket only for a container
-                            // booted with Anland, so it gates the pill, not the saved config.
+                            // The heartbeat reports the broker's socket or x11 only for a container
+                            // booted with that display, so it gates the pill, not the saved config.
                             val anlandSock = containerUsageMap[container.name]?.anlandSocket
+                            val (displayLabel, displayIcon) = when {
+                                anlandSock != null -> context.getString(R.string.anland_option) to rememberVectorPainter(Icons.Default.DesktopWindows)
+                                containerUsageMap[container.name]?.x11 == true -> context.getString(R.string.termux_x11_option) to painterResource(R.drawable.ic_x11)
+                                else -> null to null
+                            }
                             // Keyed, so a card's state stays with its container when one leaves.
                             key(entry.key) {
                                 AnimatedListEntry(entry) {
@@ -123,10 +130,14 @@ fun ControlPanelScreen(
                                         onTerminalClick = {
                                             onNavigateToTerminal(container.name)
                                         },
-                                        anlandEnabled = anlandSock != null,
-                                        onLaunchAnland = {
-                                            if (anlandSock != null && !AnlandUtils.launchWindow(context, container.name, anlandSock))
-                                                scope.showError(snackbarHostState, context.getString(R.string.anland_not_installed))
+                                        displayLabel = displayLabel,
+                                        displayIcon = displayIcon,
+                                        onLaunchDisplay = {
+                                            if (anlandSock != null) {
+                                                if (!AnlandUtils.launchWindow(context, container.name, anlandSock))
+                                                    scope.showError(snackbarHostState, context.getString(R.string.anland_not_installed))
+                                            } else if (!TermuxX11Utils.launch(context))
+                                                scope.showError(snackbarHostState, context.getString(R.string.termux_x11_not_installed))
                                         },
                                         osInfo = containerUsageMap[container.name],
                                     )

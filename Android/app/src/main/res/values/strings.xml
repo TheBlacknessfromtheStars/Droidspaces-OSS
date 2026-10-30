@@ -16,7 +16,7 @@
     <string name="feat_overhead_desc">Talks to the host Linux kernel directly. No hypervisor, no virtual machine layer.</string>
     <string name="feat_unkillable_title">Unkillable by design</string>
     <string name="feat_unkillable_desc">Supports native init.rc integration and 2-layer userspace daemons. Completely unkillable.</string>
-    <string name="feat_init_title">systemd / OpenWrt procd / OpenRC as PID 1</string>
+    <string name="feat_init_title">systemd / OpenWrt procd / OpenRC / runit as PID 1</string>
     <string name="feat_init_desc">Full init system support. Real service management, not a simulated environment.</string>
     <string name="feat_isolation_title">Complete isolation</string>
     <string name="feat_isolation_desc">Private PID tree, mount table, hostname, IPC, and cgroup hierarchy per container.</string>
@@ -174,6 +174,7 @@
     <string name="cgroup_v1_option">Cgroup V1</string>
     <string name="privileged_option">Privileged</string>
     <string name="anland_option">Anland</string>
+    <string name="termux_x11_option">Termux:X11</string>
     <string name="userns_option">Sandboxing</string>
     <string name="installation_setup_summary">Installation Summary</string>
     <string name="review_configuration">Review Configuration</string>
@@ -237,6 +238,7 @@
     <string name="run_at_boot_description">Start container on boot</string>
     <string name="enable_anland">Anland Display</string>
     <string name="enable_anland_description">Show a Wayland desktop in the Anland app</string>
+    <string name="launch_x11_description">Show the X11 desktop in the Termux:X11 app</string>
     <string name="launch_anland_window">Launch</string>
     <string name="anland_not_installed">Not available. Needs the Anland 5.x app installed. Anland 6.x is not supported.</string>
     <string name="anland_needs_gpu">Needs GPU Access or Hardware Access.</string>
@@ -244,7 +246,7 @@
     <string name="x11_replaces_anland">Off while Configure Termux:X11 is on. A container uses one display path.</string>
     <string name="auto_boot_priority">Auto Boot Priority</string>
     <string name="auto_boot_priority_description">Order in which run-at-boot containers start</string>
-    <string name="auto_boot_priority_hint">Drag to reorder. Containers start top to bottom - put a gateway (e.g. OpenWRT) first so it boots before the containers that route through it.</string>
+    <string name="auto_boot_priority_hint">Drag to reorder. Containers start top to bottom - put a gateway (e.g. OpenWrt) first so it boots before the containers that route through it.</string>
     <string name="auto_boot_priority_empty">No containers have Run at Boot enabled.</string>
     <string name="reorder_handle">Drag to reorder</string>
     <string name="force_cgroupv1">Force Cgroup V1</string>
@@ -318,7 +320,7 @@
     <string name="macvlan_mode_passthru">Passthru</string>
 
     <!-- Gateway networking mode -->
-    <string name="gateway_settings_description">Route this container through another container acting as a router (e.g. OpenWRT).</string>
+    <string name="gateway_settings_description">Route this container through another container acting as a router (e.g. OpenWrt).</string>
     <string name="gateway_container">Gateway Container</string>
     <string name="gateway_net">LAN Name</string>
     <string name="gateway_net_hint">lan</string>
@@ -327,7 +329,7 @@
     <string name="gateway_bridge">Host Bridge</string>
     <string name="gateway_bridge_hint">ds-lan</string>
     <string name="gateway_configure_intro">These control how this container plugs into the gateway\'s virtual LAN. The defaults work for a single LAN behind one gateway - change them only when running multiple LAN segments or more than one gateway.</string>
-    <string name="gateway_iface_explain">The interface name this connection shows up as INSIDE the gateway container (e.g. eth1 in OpenWRT). It must match the interface your gateway is set to serve DHCP on. Each separate segment on the same gateway needs its own unique name. Default: eth1.</string>
+    <string name="gateway_iface_explain">The interface name this connection shows up as INSIDE the gateway container (e.g. eth1 in OpenWrt). It must match the interface your gateway is set to serve DHCP on. Each separate segment on the same gateway needs its own unique name. Default: eth1.</string>
     <string name="gateway_net_explain">A label for this LAN segment. Containers that share the same gateway and LAN name join the same virtual switch and can see each other. Use a different name to spin up an isolated second segment. Default: lan.</string>
     <string name="gateway_bridge_explain">Name of the virtual switch created on the Android host. Leave empty to auto-name it from the LAN name (ds-&lt;lan&gt;). Only set this if you need an exact bridge name. Max 15 characters.</string>
     <string name="error_gateway_required">Select a gateway container</string>
@@ -449,9 +451,11 @@
     <string name="openwrt">OpenWrt</string>
     <string name="openrc_services">OpenRC Services</string>
     <string name="openrc">OpenRC</string>
+    <string name="runit_services">Runit Services</string>
+    <string name="runit">runit</string>
     <string name="init_system">Init System</string>
-    <string name="init_system_not_available">Systemd/OpenWrt/OpenRC Not Available</string>
-    <string name="init_system_not_available_desc">This container does not have systemd, OpenWrt/procd, or OpenRC installed</string>
+    <string name="init_system_not_available">Systemd/OpenWrt/OpenRC/runit Not Available</string>
+    <string name="init_system_not_available_desc">This container does not have systemd, OpenWrt/procd, runit, or OpenRC installed</string>
     <string name="fetching_services">Fetching services...</string>
     <string name="fetching_distros">Fetching distros from the rootfs repo...</string>
 
@@ -467,6 +471,7 @@
     <string name="enable_service">Enable</string>
     <string name="disable_service">Disable</string>
     <string name="restart_service">Restart service</string>
+    <string name="toggle_run_at_boot">Toggle run-at-boot</string>
     <string name="reload_service">Reload service</string>
     <string name="mask_service">Mask service</string>
     <string name="inspect_unit">Inspect unit</string>

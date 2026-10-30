@@ -276,8 +276,8 @@
     <string name="openrc_services">OpenRC 服务</string>
     <string name="openrc">OpenRC</string>
     <string name="init_system">Init 系统</string>
-    <string name="init_system_not_available">Systemd/OpenWrt/OpenRC 不可用</string>
-    <string name="init_system_not_available_desc">此容器未安装 systemd、OpenWrt/procd 或 OpenRC</string>
+    <string name="init_system_not_available">Systemd/OpenWrt/OpenRC/runit 不可用</string>
+    <string name="init_system_not_available_desc">此容器未安装 systemd、OpenWrt/procd、runit 或 OpenRC</string>
     <string name="installation_setup_summary">安装概要</string>
     <string name="refresh_users">刷新用户</string>
     <string name="mask_service">屏蔽服务</string>
@@ -308,7 +308,7 @@
     <string name="feat_overhead_desc">直接与宿主 Linux 内核交互。无需 Hypervisor，亦无虚拟机层。</string>
     <string name="feat_unkillable_title">设计上不可终止</string>
     <string name="feat_unkillable_desc">原生支持 init.rc 集成与双层用户空间守护进程。不会被轻易终止。</string>
-    <string name="feat_init_title">以 systemd / OpenWrt procd / OpenRC 作为 PID 1</string>
+    <string name="feat_init_title">以 systemd / OpenWrt procd / OpenRC / runit 作为 PID 1</string>
     <string name="feat_init_desc">支持完整的 Init 系统。具备真实的服务管理能力，并非简单的模拟环境。</string>
     <string name="feat_isolation_title">完全隔离</string>
     <string name="feat_isolation_desc">为每个容器提供独立的 PID 树、挂载表、主机名、IPC 及 cgroup 层级。</string>
@@ -422,12 +422,12 @@
     <string name="termux_requirements">Termux 要求</string>
     <string name="auto_boot_priority">自启动优先级</string>
     <string name="auto_boot_priority_description">系统启动时运行的容器的启动顺序</string>
-    <string name="auto_boot_priority_hint">拖动即可重新排列顺序。容器从上到下排列——先放置网关（例如 OpenWRT），这样它会先启动，然后才是通过它的其他容器。</string>
+    <string name="auto_boot_priority_hint">拖动即可重新排列顺序。容器从上到下排列——先放置网关（例如 OpenWrt），这样它会先启动，然后才是通过它的其他容器。</string>
     <string name="auto_boot_priority_empty">没有容器设置了“开机时自启”。</string>
     <string name="reorder_handle">拖动以重新排序</string>
     <string name="network_mode_gateway">网关（虚拟路由器）</string>
     <string name="network_mode_gateway_short">网关</string>
-    <string name="gateway_settings_description">把这个容器通过另一个充当路由器的容器（例如 OpenWRT）路由。</string>
+    <string name="gateway_settings_description">把这个容器通过另一个充当路由器的容器（例如 OpenWrt）路由。</string>
     <string name="gateway_container">网关容器</string>
     <string name="gateway_net">局域网名称</string>
     <string name="gateway_net_hint">局域网</string>
@@ -436,7 +436,7 @@
     <string name="gateway_bridge">主机桥</string>
     <string name="gateway_bridge_hint">ds-lan</string>
     <string name="gateway_configure_intro">这些控制这个容器如何接入网关的虚拟局域网。默认设置适用于单个网关后的单个局域网——只有在运行多个局域网段或多个网关时才需要更改它们。</string>
-    <string name="gateway_iface_explain">这个连接显示的接口名称在网关容器内部出现（例如 OpenWRT 中的 eth1）。它必须与网关设置为提供 DHCP 的接口匹配。同一网关上的每个独立网络段都需要一个唯一的名称。默认值：eth1。</string>
+    <string name="gateway_iface_explain">这个连接显示的接口名称在网关容器内部出现（例如 OpenWrt 中的 eth1）。它必须与网关设置为提供 DHCP 的接口匹配。同一网关上的每个独立网络段都需要一个唯一的名称。默认值：eth1。</string>
     <string name="gateway_net_explain">这个 LAN 段的标签。共享相同网关和 LAN 名称的容器会加入同一个虚拟交换机，并且可以彼此互相访问。使用不同的名称可以创建一个隔离的第二个段。默认值：lan。</string>
     <string name="gateway_bridge_explain">在 Android 主机上创建的虚拟交换机名称。留空可根据 LAN 名称自动命名（ds-&lt;lan&gt;）。只有在你需要指定精确的桥接名称时才设置。最多 15 个字符。</string>
     <string name="error_gateway_required">选择一个网关容器</string>
@@ -674,4 +674,13 @@
     <string name="upstream_max">最多可添加 %1$d 个接口。取消勾选一个即可添加另一个。</string>
     <string name="bind_path_separator">路径不能包含逗号“,”或冒号“:”</string>
     <string name="x11_replaces_anland">当使用 Termux:X11 时此选项禁用。一个容器只能使用一个显示方案。</string>
+    <string name="limit_swap">允许交换空间（swap）</string>
+    <string name="limit_swap_on">达到内存上限后可能会使用设备的交换空间</string>
+    <string name="limit_swap_off">达到内存上限后，设备的交换空间将保持空闲</string>
+    <string name="limit_swap_requirement">开启 swap accounting 的 CONFIG_MEMCG_SWAP</string>
+    <string name="runit_services">Runit 服务</string>
+    <string name="runit">runit</string>
+    <string name="toggle_run_at_boot">切换开机自启动状态</string>
+    <string name="termux_x11_option">Termux:X11</string>
+    <string name="launch_x11_description">在 Termux:X11 应用中显示 X11 桌面</string>
 </resources>

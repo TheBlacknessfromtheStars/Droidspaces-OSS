@@ -13,9 +13,7 @@ import com.droidspaces.app.util.BinaryInstaller
 import com.droidspaces.app.util.Constants
 import com.droidspaces.app.util.DroidspacesBackendStatus
 import com.droidspaces.app.util.DroidspacesChecker
-import com.droidspaces.app.util.InstallationStep
 import com.droidspaces.app.util.ModuleInstaller
-import com.droidspaces.app.util.ModuleInstallationStep
 import com.droidspaces.app.util.PreferencesManager
 import com.droidspaces.app.util.RootChecker
 import com.droidspaces.app.util.RootStatus
@@ -50,15 +48,9 @@ class AppStateViewModel(application: Application) : AndroidViewModel(application
     // Initialize with cached status to prevent UI glitches on boot
     var backendStatus: DroidspacesBackendStatus by mutableStateOf(
         prefsManager.cachedBackendStatus?.let { cached ->
-            when (cached) {
-                "UpdateAvailable" -> DroidspacesBackendStatus.UpdateAvailable
-                "NotInstalled" -> DroidspacesBackendStatus.NotInstalled
-                "Corrupted" -> DroidspacesBackendStatus.Corrupted
-                "ModuleMissing" -> DroidspacesBackendStatus.ModuleMissing
-                "Checking" -> DroidspacesBackendStatus.Checking
-                "" -> DroidspacesBackendStatus.Available
-                else -> DroidspacesBackendStatus.Checking
-            }
+            // Older builds cached Available as ""
+            if (cached == "") DroidspacesBackendStatus.Available
+            else DroidspacesBackendStatus.entries.firstOrNull { it.name == cached }
         } ?: DroidspacesBackendStatus.Checking
     )
         private set
@@ -81,10 +73,6 @@ class AppStateViewModel(application: Application) : AndroidViewModel(application
     private var refreshJob: Job? = null
 
     // ── Installation flow state (drives InstallationScreen) ─────────────────────
-    var installCurrentStep by mutableStateOf<InstallationStep?>(null)
-        private set
-    var installCurrentModuleStep by mutableStateOf<ModuleInstallationStep?>(null)
-        private set
     var isInstalling by mutableStateOf(false)
         private set
     var isInstallSuccess by mutableStateOf(false)
@@ -130,16 +118,8 @@ class AppStateViewModel(application: Application) : AndroidViewModel(application
                 hasCompletedInitialCheck = true
 
                 // Only cache non-Checking statuses to prevent UI glitches
-                if (finalStatus !is DroidspacesBackendStatus.Checking) {
-                    prefsManager.cachedBackendStatus = when (finalStatus) {
-                        DroidspacesBackendStatus.UpdateAvailable -> "UpdateAvailable"
-                        DroidspacesBackendStatus.NotInstalled -> "NotInstalled"
-                        DroidspacesBackendStatus.Corrupted -> "Corrupted"
-                        DroidspacesBackendStatus.ModuleMissing -> "ModuleMissing"
-                        DroidspacesBackendStatus.Available -> ""
-                        DroidspacesBackendStatus.Checking -> "" // Should not happen, but handle gracefully
-                    }
-                }
+                if (finalStatus != DroidspacesBackendStatus.Checking)
+                    prefsManager.cachedBackendStatus = finalStatus.name
             } catch (e: Exception) {
                 if (previousStatus != DroidspacesBackendStatus.NotInstalled) {
                     backendStatus = DroidspacesBackendStatus.NotInstalled
@@ -149,14 +129,6 @@ class AppStateViewModel(application: Application) : AndroidViewModel(application
                 isRefreshing = false
             }
         }
-    }
-
-    /**
-     * Force a refresh of backend status.
-     * Use this for pull-to-refresh or after installation.
-     */
-    fun forceRefresh() {
-        checkBackendStatus(force = true)
     }
 
     /**
@@ -187,8 +159,6 @@ class AppStateViewModel(application: Application) : AndroidViewModel(application
         if (isInstalling) return
         isInstalling = true
 
-        installCurrentStep = null
-        installCurrentModuleStep = null
         isInstallingModule = false
         isInstallSuccess = false
         installErrorMessage = null
@@ -205,7 +175,7 @@ class AppStateViewModel(application: Application) : AndroidViewModel(application
         }
         val wasDaemon = whichBackendMode == "DAEMON"
 
-        val isAtomicUpdate = backendStatus is DroidspacesBackendStatus.UpdateAvailable
+        val isAtomicUpdate = backendStatus == DroidspacesBackendStatus.UpdateAvailable
 
         // Capture symlink state before any module directory removal
         val wasSymlinkEnabled = withContext(Dispatchers.IO) {
@@ -222,14 +192,11 @@ class AppStateViewModel(application: Application) : AndroidViewModel(application
 
         if (!isAtomicUpdate) {
             // Clean Slate: Remove the old module, but NEVER the bin directory.
-            installCurrentStep = InstallationStep.CreatingDirectories("Nuking existing module...")
             Shell.cmd("rm -rf '/data/adb/modules/droidspaces' 2>&1").exec()
         }
 
         // Step 2: Install binaries (atomic mv to canonical path)
-        val binaryResult = BinaryInstaller.install(context) { step ->
-            installCurrentStep = step
-        }
+        val binaryResult = BinaryInstaller.install(context)
         binaryResult.fold(
             onSuccess = {
                 if (wasDaemon) {
@@ -237,9 +204,7 @@ class AppStateViewModel(application: Application) : AndroidViewModel(application
                 }
                 // Step 3: Install module
                 isInstallingModule = true
-                val moduleResult = ModuleInstaller.install(context) { step ->
-                    installCurrentModuleStep = step
-                }
+                val moduleResult = ModuleInstaller.install(context)
                 moduleResult.fold(
                     onSuccess = {
                         val daemonFileExists = withContext(Dispatchers.IO) {
@@ -260,14 +225,14 @@ class AppStateViewModel(application: Application) : AndroidViewModel(application
                         isInstalling = false
                         isInstallingModule = false
                         resetForPostInstallation()
-                        forceRefresh()
+                        checkBackendStatus(force = true)
                     },
                     onFailure = { error ->
                         installErrorMessage = error.message ?: context.getString(R.string.module_installation_failed)
                         isInstalling = false
                         isInstallingModule = false
                         resetForPostInstallation()
-                        forceRefresh()
+                        checkBackendStatus(force = true)
                     }
                 )
             },
@@ -275,7 +240,7 @@ class AppStateViewModel(application: Application) : AndroidViewModel(application
                 installErrorMessage = error.message ?: context.getString(R.string.binary_installation_failed)
                 isInstalling = false
                 resetForPostInstallation()
-                forceRefresh()
+                checkBackendStatus(force = true)
             }
         )
     }

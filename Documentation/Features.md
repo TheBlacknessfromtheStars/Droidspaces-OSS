@@ -74,7 +74,7 @@ The six host virtual terminals, `tty1` to `tty6`, stay hidden even with hardware
 
 ### GPU Access
 
-`--gpu`, key `enable_gpu_mode`. The middle ground. The container keeps its private `/dev` and only the GPU render nodes are mirrored into it, so programs can use the GPU and nothing else on the host is exposed. Mirrored nodes are owned by a `droidspaces-gpu` group that root belongs to; add other users to that group with `usermod`. Hardware Access turns this on as well.
+`--gpu`, key `enable_gpu_mode`. The middle ground. The container keeps its private `/dev` and only the GPU render nodes are mirrored into it, so programs can use the GPU and nothing else on the host is exposed. Mirrored nodes are owned by root and a `droidspaces-gpu` group; add other users to that group with `usermod`. Hardware Access turns this on as well.
 
 Known GPU families: Mesa DRI render nodes on Intel, AMD and most ARM SoCs, Qualcomm Adreno (`kgsl`), ARM Mali, NVIDIA, PowerVR and the DMA heaps these drivers need.
 
@@ -99,7 +99,7 @@ Known GPU families: Mesa DRI render nodes on Intel, AMD and most ARM SoCs, Qualc
 `--memory=SIZE`, `--cpus=COUNT` and `--pids-limit=N`, keys `memory_limit`, `cpu_quota` with `cpu_period`, and `pids_limit`. Off by default; a container shares everything the device has.
 
 - **Limit memory**: `--memory=512M` or `--memory=2G`. The container cannot grow past it into the device's swap, so at the limit its own OOM killer ends a process inside it instead of the phone slowing down as zram fills. Everything inside the container, `free` and fastfetch included, reports usage against this limit and no swap.
-- **Allow swap**: `--allow-swap`, key `allow_swap`. Lets a memory-limited container use the device's swap past its limit, as it could before the cap, and shows it the device's swap. `droidspaces info` and `show --format` say whether a running container may swap.
+- **Allow swap**: `--allow-swap`, key `allow_swap`. Lets a memory-limited container use the device's swap past its limit, as it could before the cap, and shows it the device's swap. `droidspaces info` and `show --json` say whether a running container may swap.
 - **Limit CPU**: `--cpus=1.5` gives the container one and a half cores' worth of time, spread over all cores.
 - **Limit processes**: the most processes and threads the container may have at once, minimum 16. A systemd distribution needs a few hundred.
 
@@ -173,7 +173,7 @@ Chosen once, when the container is installed.
 
 ## Things with no toggle
 
-**Init systems.** Any init that can run as PID 1 works: systemd, OpenRC, runit, s6, SysVinit, OpenWrt's procd. The container's `/sbin/init` must exist, or you name another with Custom Init Binary. The app's container details recognise systemd, OpenRC and procd and let you manage their services.
+**Init systems.** Any init that can run as PID 1 works: systemd, OpenRC, runit, s6, SysVinit, OpenWrt's procd. The container's `/sbin/init` must exist, or you name another with Custom Init Binary. The app's container details recognise systemd, OpenRC, procd and runit and let you manage their services.
 
 **Hostname.** `--hostname=NAME`, key `hostname`. Defaults to the container name.
 

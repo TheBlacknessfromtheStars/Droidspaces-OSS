@@ -394,11 +394,6 @@ void cleanup_container_resources(struct ds_config *cfg, pid_t pid,
     firmware_path_remove(fw_path);
   }
 
-  /* 2. Resolve global PID file path */
-  char global_pidfile[PATH_MAX];
-  resolve_pidfile_from_name(cfg->container_name, global_pidfile,
-                            sizeof(global_pidfile));
-
   /* 3. Handle Volatile Overlay Cleanup (upper/work/merged)
    * This MUST happen before unmounting the lower rootfs image.
    * When force_cleanup, use detach+force unmount to avoid hangs. */
@@ -432,12 +427,8 @@ void cleanup_container_resources(struct ds_config *cfg, pid_t pid,
 
   /* 5. Unlink PID files. A restart (skip_unmount) keeps them: the monitor
    * reads the dead PID in them as "nobody has claimed this exit yet". */
-  if (!skip_unmount) {
-    if (cfg->pidfile[0])
-      unlink(cfg->pidfile);
-    if (global_pidfile[0] && strcmp(cfg->pidfile, global_pidfile) != 0)
-      unlink(global_pidfile);
-  }
+  if (!skip_unmount)
+    unlink(cfg->pidfile);
 
   /* Network cleanup: remove host veth and owned network state. Any isolated
    * mode can be someone's gateway (an OpenWrt in --net=none, say), and its
@@ -517,6 +508,12 @@ static int start_rootfs_locked(struct ds_config *cfg, int *lock_fd,
   int has_side_effects = 0;
   int sync_pipe[2] = {-1, -1}; /* read by cleanup: set before any goto */
   pid_t tweaks_pid = -1;       /* the android_optimizations(1) helper */
+
+  /* Console fds, filled in once init sends its pty up. Every caller hands us
+   * a zeroed cfg, and 0 is stdin, which cleanup must never close. */
+  cfg->console.master = cfg->console.slave = -1;
+  cfg->console_sock[0] = cfg->console_sock[1] = -1;
+  cfg->console_fwd[0] = cfg->console_fwd[1] = -1;
 
   /* Here and not with the other network checks in main.c: a restart reloads
    * its config after those ran, and this is the one both paths go through. */
@@ -769,35 +766,9 @@ static int start_rootfs_locked(struct ds_config *cfg, int *lock_fd,
     firmware_path_add(fw_path);
   }
 
-  ds_fix_host_ptys();
-
-  if (ds_terminal_create(&cfg->console) < 0) {
-    ds_error("Failed to allocate console PTY");
-    goto cleanup;
-  }
-
-  /* Propagate the host terminal's window size to the console PTY master
-   * so the slave (which becomes /dev/console) has correct dimensions
-   * from the very start of boot. This prevents misaligned output during
-   * the window between PTY creation and the console_monitor_loop startup.
-   * Without this, 'sudo poweroff' output is misaligned for the first
-   * ~10 lines because sudo resets/queries the terminal size and finds
-   * a {0,0} winsize on the PTY slave. */
-  if (isatty(STDIN_FILENO)) {
-    struct winsize ws;
-    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
-      ioctl(cfg->console.master, TIOCSWINSZ, &ws);
-  }
-
-  /* 5. Resolve target PID file names early so monitor inherits them */
-  char global_pidfile[PATH_MAX];
-  resolve_pidfile_from_name(cfg->container_name, global_pidfile,
-                            sizeof(global_pidfile));
-
-  /* If no pidfile specified, or we want to use the global one */
-  if (!cfg->pidfile[0]) {
-    safe_strncpy(cfg->pidfile, global_pidfile, sizeof(cfg->pidfile));
-  }
+  /* 5. Resolve the PID file path early so the monitor inherits it */
+  resolve_pidfile_from_name(cfg->container_name, cfg->pidfile,
+                            sizeof(cfg->pidfile));
 
   /* Three binder round trips into system_server. They used to run after the
    * host-side network setup, in series, with the whole start waiting on them.
@@ -837,6 +808,16 @@ static int start_rootfs_locked(struct ds_config *cfg, int *lock_fd,
   /* Record start time before fork so monitor and virtualize_update share it */
   clock_gettime(CLOCK_BOOTTIME, &cfg->start_time);
 
+  /* The console is allocated by init from the container's own devpts, so the
+   * host's /dev/pts never carries it, and comes back up this socketpair. */
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, cfg->console_sock) <
+          0 ||
+      (cfg->foreground && socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+                                     cfg->console_fwd) < 0)) {
+    ds_error("socketpair failed: %s", strerror(errno));
+    goto cleanup;
+  }
+
   /* 8. Fork Monitor Process */
   pid_t monitor_pid = fork();
   if (monitor_pid < 0) {
@@ -857,6 +838,13 @@ static int start_rootfs_locked(struct ds_config *cfg, int *lock_fd,
 
   /* PARENT PROCESS */
   close(sync_pipe[1]);
+  close(cfg->console_sock[0]);
+  close(cfg->console_sock[1]);
+  cfg->console_sock[0] = cfg->console_sock[1] = -1;
+  if (cfg->foreground) {
+    close(cfg->console_fwd[1]);
+    cfg->console_fwd[1] = -1;
+  }
 
   /* Wait for Monitor to send child PID */
   if (read(sync_pipe[0], &cfg->container_pid, sizeof(pid_t)) != sizeof(pid_t)) {
@@ -882,17 +870,8 @@ static int start_rootfs_locked(struct ds_config *cfg, int *lock_fd,
   char pid_str[32];
   snprintf(pid_str, sizeof(pid_str), "%d", cfg->container_pid);
 
-  /* Always save to global Pids directory (for --name lookups) */
-  if (write_file_atomic(global_pidfile, pid_str) < 0) {
-    ds_error("Failed to write PID file: %s", global_pidfile);
-  }
-
-  /* Also save to user-specified --pidfile if different */
-  if (cfg->pidfile[0] && strcmp(cfg->pidfile, global_pidfile) != 0) {
-    if (write_file_atomic(cfg->pidfile, pid_str) < 0) {
-      ds_error("Failed to write PID file: %s", cfg->pidfile);
-    }
-  }
+  if (write_file_atomic(cfg->pidfile, pid_str) < 0)
+    ds_error("Failed to write PID file: %s", cfg->pidfile);
 
   /* 11. Do not show the info or return until init has exec'd. A command that
    * returned earlier left init still logging to a terminal nobody was reading
@@ -911,7 +890,9 @@ static int start_rootfs_locked(struct ds_config *cfg, int *lock_fd,
     ds_container_unlock(*lock_fd);
     *lock_fd = -1;
 
-    int ret = console_monitor_loop(cfg->console.master, monitor_pid, cfg);
+    int ret = console_monitor_loop(cfg->console_fwd[0], monitor_pid, cfg);
+    close(cfg->console_fwd[0]);
+    cfg->console_fwd[0] = -1;
     free_config_env_vars(cfg);
     return ret;
   } else {
@@ -926,7 +907,6 @@ static int start_rootfs_locked(struct ds_config *cfg, int *lock_fd,
     }
 
     show_info(cfg, 1);
-    ds_socketd_record_core_event("start", cfg->container_name, cfg->uuid);
     ds_log("Container '%s' is running in background.", cfg->container_name);
     if (is_android()) {
       ds_log("Use 'su -c \"%s --name='%s' enter\"' to connect.", cfg->prog_name,
@@ -954,9 +934,12 @@ cleanup:
   if (has_side_effects) {
     cleanup_container_resources(cfg, cfg->container_pid, 0, 1 /* force */);
   }
-  if (cfg->console.master >= 0) {
-    close(cfg->console.master);
-    cfg->console.master = -1;
+  for (int i = 0; i < 2; i++) {
+    if (cfg->console_sock[i] >= 0)
+      close(cfg->console_sock[i]);
+    if (cfg->console_fwd[i] >= 0)
+      close(cfg->console_fwd[i]);
+    cfg->console_sock[i] = cfg->console_fwd[i] = -1;
   }
   if (sync_pipe[0] >= 0)
     close(sync_pipe[0]);
@@ -1007,10 +990,7 @@ static int load_booted_config(const struct ds_config *cfg, pid_t pid,
                            sizeof(run_path)) != 0)
     return -1;
 
-  memset(out, 0, sizeof(*out));
-  out->net_ready_pipe[0] = out->net_ready_pipe[1] = -1;
-  out->net_done_pipe[0] = out->net_done_pipe[1] = -1;
-  out->net_mode = DS_NET_NAT; /* zero is host, see main() */
+  ds_config_init(out);
   safe_strncpy(out->container_name, cfg->container_name,
                sizeof(out->container_name));
   safe_strncpy(out->prog_name, cfg->prog_name, sizeof(out->prog_name));
@@ -1081,19 +1061,7 @@ static int stop_rootfs_locked(struct ds_config *caller_cfg, int skip_unmount,
     if (build_proc_root_path(pid, "", probe_root, sizeof(probe_root)) == 0)
       init_type = detect_container_init(probe_root);
 
-    switch (init_type) {
-    case DS_INIT_PROCD:
-    case DS_INIT_S6:
-    case DS_INIT_BUSYBOX:
-      kill(pid, SIGUSR2);
-      break;
-    case DS_INIT_RUNIT:
-      kill(pid, SIGCONT);
-      break;
-    case DS_INIT_SYSTEMD:
-      kill(pid, DS_SIG_STOP); /* SIGRTMIN+3 */
-      break;
-    case DS_INIT_SYSVINIT: {
+    if (init_type == DS_INIT_SYSVINIT) {
       /* sysvinit ignores all signals for shutdown -- it only listens on the
        * initctl FIFO. Write a telinit-compatible init_request struct directly
        * into the container's /run/initctl via /proc/<pid>/root. */
@@ -1138,14 +1106,19 @@ static int stop_rootfs_locked(struct ds_config *caller_cfg, int skip_unmount,
                 "falling back to SIGPWR");
         kill(pid, SIGPWR);
       }
-      break;
-    }
-    case DS_INIT_OPENRC:
-      kill(pid, SIGPWR);
-      break;
-    default: /* unknown */
-      kill(pid, SIGTERM);
-      break;
+    } else {
+      /* Each family's own shutdown request; SIGTERM when we cannot tell. */
+      int sig = SIGTERM;
+      if (init_type == DS_INIT_PROCD || init_type == DS_INIT_S6 ||
+          init_type == DS_INIT_BUSYBOX)
+        sig = SIGUSR2;
+      else if (init_type == DS_INIT_RUNIT)
+        sig = SIGCONT;
+      else if (init_type == DS_INIT_SYSTEMD)
+        sig = DS_SIG_STOP; /* SIGRTMIN+3 */
+      else if (init_type == DS_INIT_OPENRC)
+        sig = SIGPWR;
+      kill(pid, sig);
     }
 
     ds_log("Waiting for graceful shutdown (this may take up to %d seconds)...",
@@ -1211,7 +1184,6 @@ static int stop_rootfs_locked(struct ds_config *caller_cfg, int skip_unmount,
   /* 5. Complete resource cleanup. */
   cleanup_container_resources(cfg, pid, skip_unmount, unkillable);
   ds_container_prune_supervision(cfg->container_name);
-  ds_socketd_record_core_event("die", cfg->container_name, cfg->uuid);
 
   if (!cfg->foreground)
     ds_log("Container '%s' stopped.", cfg->container_name);
@@ -1393,7 +1365,7 @@ int enter_rootfs(struct ds_config *cfg, const char *user) {
      * and the seccomp filter below denies that very magic reboot. */
     ds_ksu_neutralize_root_escape();
     ds_seccomp_apply_minimal(cfg->privileged_mask, cfg->sandboxing_allowed);
-    android_seccomp_setup(cfg->privileged_mask);
+    ds_seccomp_keyring_shim(cfg->privileged_mask);
     ds_apply_capability_hardening(cfg->hw_access, cfg->privileged_mask,
                                   cfg->sandboxing_allowed);
     ds_log_silent = 0;
@@ -1586,7 +1558,7 @@ int run_in_rootfs(struct ds_config *cfg, char **argv, const char *as_user) {
      * and the seccomp filter below denies that very magic reboot. */
     ds_ksu_neutralize_root_escape();
     ds_seccomp_apply_minimal(cfg->privileged_mask, cfg->sandboxing_allowed);
-    android_seccomp_setup(cfg->privileged_mask);
+    ds_seccomp_keyring_shim(cfg->privileged_mask);
     ds_apply_capability_hardening(cfg->hw_access, cfg->privileged_mask,
                                   cfg->sandboxing_allowed);
     ds_log_silent = 0;
@@ -1713,7 +1685,7 @@ int show_info(struct ds_config *cfg, int trust_cfg_pid) {
       safe_strncpy(cfg->container_name, first_name,
                    sizeof(cfg->container_name));
       resolve_pidfile_from_name(first_name, cfg->pidfile, sizeof(cfg->pidfile));
-    } else if (cfg->format_output) {
+    } else if (cfg->json_output) {
       return show_containers(cfg);
     } else {
       /* Multiple containers running, show Host info and list */
@@ -1763,14 +1735,19 @@ int show_info(struct ds_config *cfg, int trust_cfg_pid) {
                        &lim_pids, &swap_capped);
   int swap_allowed = !swap_capped;
 
+  /* The acronym stays upper case in the output, the config file has nat. */
+  const char *net =
+      cfg->net_mode == DS_NET_NAT ? "NAT" : ds_net_mode_name(cfg->net_mode);
+
   /* Success - print Host and detailed Container info */
-  if (cfg->format_output) {
+  if (cfg->json_output) {
     struct ds_status st = {0};
     safe_strncpy(st.name, cfg->container_name, sizeof(st.name));
     st.pid = pid;
     safe_strncpy(st.hostname, cfg->hostname, sizeof(st.hostname));
     ds_anland_load_sock(cfg);
     safe_strncpy(st.anland_sock, cfg->anland_sock, sizeof(st.anland_sock));
+    st.x11 = cfg->x11;
     long ram_total = ds_collect_status(&st, 1);
 
     int first = 1;
@@ -1780,24 +1757,6 @@ int show_info(struct ds_config *cfg, int trust_cfg_pid) {
     ds_json_status(&st, &first);
     ds_json_int("ram_total_kb", ram_total, &first);
 
-    const char *net;
-    switch (cfg->net_mode) {
-    case DS_NET_NAT:
-      net = "NAT";
-      break;
-    case DS_NET_NONE:
-      net = "none";
-      break;
-    case DS_NET_GATEWAY:
-      net = "gateway";
-      break;
-    case DS_NET_MACVLAN:
-      net = "macvlan";
-      break;
-    default:
-      net = "host";
-      break;
-    }
     ds_json_str("networking_mode", net, &first);
 
     char buf[1024];
@@ -1838,7 +1797,6 @@ int show_info(struct ds_config *cfg, int trust_cfg_pid) {
                 cfg->hw_access ? "full" : (cfg->gpu_mode ? "GPU" : "none"),
                 &first);
 
-    ds_json_int("x11", cfg->x11, &first);
     if (is_android()) {
       if (cfg->tx11_extra_flags)
         ds_json_str("tx11_flags", cfg->tx11_extra_flags, &first);
@@ -1882,21 +1840,8 @@ int show_info(struct ds_config *cfg, int trust_cfg_pid) {
     }
     ds_json_str("port_forwards", cfg->port_forward_count ? buf : "", &first);
 
-    if (cfg->privileged_mask == DS_PRIV_FULL) {
-      ds_json_str("privileged_mode", "full", &first);
-    } else if (cfg->privileged_mask > 0) {
-      pos = 0;
-      const struct {
-        int bit;
-        const char *name;
-      } bits[] = {{DS_PRIV_NOMASK, "nomask"},
-                  {DS_PRIV_NOCAPS, "nocaps"},
-                  {DS_PRIV_NOSEC, "noseccomp"},
-                  {DS_PRIV_SHARED, "shared"}};
-      for (size_t i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
-        if (cfg->privileged_mask & bits[i].bit)
-          pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "%s%s",
-                                  pos ? "," : "", bits[i].name);
+    if (cfg->privileged_mask > 0) {
+      ds_privileged_names(cfg->privileged_mask, buf, sizeof(buf), ",");
       ds_json_str("privileged_mode", buf, &first);
     }
 
@@ -1939,24 +1884,6 @@ int show_info(struct ds_config *cfg, int trust_cfg_pid) {
     int feat_count = 0;
 
     /* 1. Networking Mode */
-    const char *net;
-    switch (cfg->net_mode) {
-    case DS_NET_NAT:
-      net = "NAT";
-      break;
-    case DS_NET_NONE:
-      net = "none";
-      break;
-    case DS_NET_GATEWAY:
-      net = "gateway";
-      break;
-    case DS_NET_MACVLAN:
-      net = "macvlan";
-      break;
-    default:
-      net = "host";
-      break;
-    }
     printf("  Networking: %s\n", net);
     feat_count++;
 
@@ -2096,29 +2023,9 @@ int show_info(struct ds_config *cfg, int trust_cfg_pid) {
 
     /* 15. Privileged Mode */
     if (cfg->privileged_mask > 0) {
-      printf("  " C_RED "Privileged mode:" C_RESET " ");
-      if (cfg->privileged_mask == DS_PRIV_FULL) {
-        printf("full");
-      } else {
-        int first = 1;
-        if (cfg->privileged_mask & DS_PRIV_NOMASK) {
-          printf("%snomask", first ? "" : ", ");
-          first = 0;
-        }
-        if (cfg->privileged_mask & DS_PRIV_NOCAPS) {
-          printf("%snocaps", first ? "" : ", ");
-          first = 0;
-        }
-        if (cfg->privileged_mask & DS_PRIV_NOSEC) {
-          printf("%snoseccomp", first ? "" : ", ");
-          first = 0;
-        }
-        if (cfg->privileged_mask & DS_PRIV_SHARED) {
-          printf("%sshared", first ? "" : ", ");
-          first = 0;
-        }
-      }
-      printf("\n");
+      char tags[64];
+      ds_privileged_names(cfg->privileged_mask, tags, sizeof(tags), ", ");
+      printf("  " C_RED "Privileged mode:" C_RESET " %s\n", tags);
       feat_count++;
     }
 
@@ -2143,64 +2050,63 @@ int show_info(struct ds_config *cfg, int trust_cfg_pid) {
     if (feat_count == 0) {
       printf("  None\n");
     }
-  }
 
-  /* Resource limits in force. Live usage only for the info command: right
-   * after a start or restart there is nothing meaningful to report yet. */
-  if (lim_mem || lim_quota || lim_pids) {
-    long long mu = -1, cache = 0, cu = -1, pu = -1;
-    if (!trust_cfg_pid)
-      ds_cgroup_get_usage(cfg->container_name, &mu, &cache, &cu, &pu);
-    /* Used as free(1) counts it: without the reclaimable file cache */
-    if (mu >= cache)
-      mu -= cache;
-    printf("\n" C_GREEN "Resources:" C_RESET "\n");
+    /* Resource limits in force. Live usage only for the info command: right
+     * after a start or restart there is nothing meaningful to report yet. */
+    if (lim_mem || lim_quota || lim_pids) {
+      long long mu = -1, cache = 0, cu = -1, pu = -1;
+      if (!trust_cfg_pid)
+        ds_cgroup_get_usage(cfg->container_name, &mu, &cache, &cu, &pu);
+      /* Used as free(1) counts it: without the reclaimable file cache */
+      if (mu >= cache)
+        mu -= cache;
+      printf("\n" C_GREEN "Resources:" C_RESET "\n");
 
-    if (lim_mem) {
-      char used[32], lim[32];
-      ds_format_size(lim_mem, lim, sizeof(lim));
-      if (mu >= 0) {
-        ds_format_size(mu, used, sizeof(used));
-        printf("  Memory : %s / %s\n", used, lim);
-      } else {
-        printf("  Memory : %s\n", lim);
+      if (lim_mem) {
+        char used[32], lim[32];
+        ds_format_size(lim_mem, lim, sizeof(lim));
+        if (mu >= 0) {
+          ds_format_size(mu, used, sizeof(used));
+          printf("  Memory : %s / %s\n", used, lim);
+        } else {
+          printf("  Memory : %s\n", lim);
+        }
+        printf("  Swap   : %s\n", swap_allowed ? "allowed" : "not allowed");
       }
-      printf("  Swap   : %s\n", swap_allowed ? "allowed" : "not allowed");
+      if (lim_quota) {
+        double cores = (double)lim_quota / (double)lim_period;
+        printf("  CPU    : %.2f cores", cores);
+        long uptime = cu >= 0 ? ds_get_container_uptime(pid) : 0;
+        /* Average use of the allowed cores since boot. cu is in usec. */
+        if (uptime > 0)
+          printf(" (Avg usage: %.1f%%)",
+                 ((double)cu / 1e6 / (double)uptime) / cores * 100.0);
+        printf("\n");
+      }
+      if (lim_pids) {
+        printf("  PIDs   : %lld", lim_pids);
+        if (pu >= 0)
+          printf(" (current: %lld)", pu);
+        printf("\n");
+      }
     }
-    if (lim_quota) {
-      double cores = (double)lim_quota / (double)lim_period;
-      printf("  CPU    : %.2f cores", cores);
-      long uptime = cu >= 0 ? ds_get_container_uptime(pid) : 0;
-      /* Average use of the allowed cores since boot. cu is in usec. */
-      if (uptime > 0)
-        printf(" (Avg usage: %.1f%%)",
-               ((double)cu / 1e6 / (double)uptime) / cores * 100.0);
-      printf("\n");
-    }
-    if (lim_pids) {
-      printf("  PIDs   : %lld", lim_pids);
-      if (pu >= 0)
-        printf(" (current: %lld)", pu);
-      printf("\n");
-    }
+    printf("\n");
   }
-
-  printf("\n");
   return 0;
 }
 
 /* The body of a restart. One lock covers the stop and the start, so nothing
  * else can act on the container in the gap where the old instance is gone and
  * the new one is not up yet. */
-static int restart_rootfs_locked(struct ds_config *cfg, int *lock_fd,
-                                 int timeout_seconds, int argc, char **argv) {
+static int restart_rootfs_locked(struct ds_config *cfg, int *lock_fd, int argc,
+                                 char **argv) {
   pid_t pid = 0;
   if (!is_container_running(cfg, &pid) || pid <= 0) {
     ds_error("Container '%s' is not running or invalid.", cfg->container_name);
     return -1;
   }
   ds_log("Restarting container %s...", cfg->container_name);
-  if (stop_rootfs_locked(cfg, 1, timeout_seconds) < 0) {
+  if (stop_rootfs_locked(cfg, 1, DS_STOP_TIMEOUT) < 0) {
     return -1;
   }
   /* The stop above tore down using the booted snapshot (loaded while the
@@ -2219,7 +2125,7 @@ static int restart_rootfs_locked(struct ds_config *cfg, int *lock_fd,
      * the two loads instead of being replaced. */
     ds_config_reset_defaults(cfg);
     ds_config_load_by_name(cfg->container_name, cfg);
-    if (argv && ds_apply_cli_overrides(argc, argv, cfg, 0) != 0)
+    if (ds_apply_cli_overrides(argc, argv, cfg, 0) != 0)
       return -1;
   }
   putchar('\n');
@@ -2227,17 +2133,12 @@ static int restart_rootfs_locked(struct ds_config *cfg, int *lock_fd,
   return start_rootfs_locked(cfg, lock_fd, 1);
 }
 
-int restart_rootfs_with_timeout(struct ds_config *cfg, int timeout_seconds,
-                                int argc, char **argv) {
+int restart_rootfs(struct ds_config *cfg, int argc, char **argv) {
   int lock_fd = lifecycle_lock_or_complain(cfg, "restart");
   if (lock_fd < 0)
     return -1;
 
-  int ret = restart_rootfs_locked(cfg, &lock_fd, timeout_seconds, argc, argv);
+  int ret = restart_rootfs_locked(cfg, &lock_fd, argc, argv);
   ds_container_unlock(lock_fd);
   return ret;
-}
-
-int restart_rootfs(struct ds_config *cfg, int argc, char **argv) {
-  return restart_rootfs_with_timeout(cfg, DS_STOP_TIMEOUT, argc, argv);
 }

@@ -190,50 +190,34 @@ object StorageChecker {
      *
      * Performance: ~10-50ms (runs in background)
      */
-    suspend fun getFreeSpaceGB(path: String = "/data"): Int? = withContext(Dispatchers.IO) {
-        try {
-            val quoted = ContainerCommandBuilder.quote(path)
+    private suspend fun getFreeSpaceGB(path: String): Int? = withContext(Dispatchers.IO) {
+        val quoted = ContainerCommandBuilder.quote(path)
 
-            // Try using stat first (more accurate)
-            val statResult = Shell.cmd("stat -f -c '%a %S' $quoted 2>/dev/null").exec()
-            if (statResult.isSuccess && statResult.out.isNotEmpty()) {
-                val parts = statResult.out[0].trim().split(" ")
-                if (parts.size == 2) {
-                    val availBlocks = parts[0].toLongOrNull()
-                    val blockSize = parts[1].toLongOrNull()
-                    if (availBlocks != null && blockSize != null && blockSize > 0) {
-                        val freeGB = (availBlocks * blockSize / 1024 / 1024 / 1024).toInt()
-                        return@withContext freeGB
-                    }
-                }
-            }
-
-            // Fallback: use busybox df
-            val dfResult = Shell.cmd("$BUSYBOX_PATH df -k $quoted 2>/dev/null | $BUSYBOX_PATH tail -n1 | $BUSYBOX_PATH awk '{print \$4}'").exec()
-            if (dfResult.isSuccess && dfResult.out.isNotEmpty()) {
-                val freeKB = dfResult.out[0].trim().toLongOrNull()
-                if (freeKB != null && freeKB > 0) {
-                    val freeGB = (freeKB / 1024 / 1024).toInt()
+        // Try using stat first (more accurate)
+        val statResult = Shell.cmd("stat -f -c '%a %S' $quoted 2>/dev/null").exec()
+        if (statResult.isSuccess && statResult.out.isNotEmpty()) {
+            val parts = statResult.out[0].trim().split(" ")
+            if (parts.size == 2) {
+                val availBlocks = parts[0].toLongOrNull()
+                val blockSize = parts[1].toLongOrNull()
+                if (availBlocks != null && blockSize != null && blockSize > 0) {
+                    val freeGB = (availBlocks * blockSize / 1024 / 1024 / 1024).toInt()
                     return@withContext freeGB
                 }
             }
-
-            null
-        } catch (e: Exception) {
-            null
         }
+
+        // Fallback: use busybox df
+        val dfResult = Shell.cmd("$BUSYBOX_PATH df -k $quoted 2>/dev/null | $BUSYBOX_PATH tail -n1 | $BUSYBOX_PATH awk '{print \$4}'").exec()
+        if (dfResult.isSuccess && dfResult.out.isNotEmpty()) {
+            val freeKB = dfResult.out[0].trim().toLongOrNull()
+            if (freeKB != null && freeKB > 0) {
+                val freeGB = (freeKB / 1024 / 1024).toInt()
+                return@withContext freeGB
+            }
+        }
+
+        null
     }
 
-    /**
-     * Check if sufficient space is available (default 4GB minimum) at [path].
-     * Returns true if space is sufficient, false otherwise.
-     * Returns null if unable to determine.
-     */
-    suspend fun hasSufficientSpace(
-        requiredGB: Int = Constants.MIN_STORAGE_GB,
-        path: String = "/data",
-    ): Boolean? = withContext(Dispatchers.IO) {
-        val freeGB = getFreeSpaceGB(path) ?: return@withContext null
-        freeGB >= requiredGB
-    }
 }

@@ -37,18 +37,12 @@ class SystemStatsViewModel(application: Application) : AndroidViewModel(applicat
         if (running.isEmpty()) return
 
         while (true) {
-            // One `show --format` call covers every container, so a tick costs the same
+            // One `show --json` call covers every container, so a tick costs the same
             // for ten containers as for one. Absence from the result means it died.
             val live = ContainerOSInfoManager.fetchAll(getApplication())
             val dead = running.filter { it.name !in live }
             dead.forEach { container ->
-                val ctx = getApplication<Application>()
-                ctx.startService(
-                    android.content.Intent(ctx, com.droidspaces.app.service.TerminalSessionService::class.java).apply {
-                        action = com.droidspaces.app.service.TerminalSessionService.ACTION_STOP_CONTAINER_SESSIONS
-                        putExtra(com.droidspaces.app.service.TerminalSessionService.EXTRA_CONTAINER_NAME, container.name)
-                    }
-                )
+                com.droidspaces.app.service.TerminalSessionService.stopContainerSessions(getApplication(), container.name)
                 containerUsageMap.remove(container.name)
             }
             containerUsageMap.putAll(live)

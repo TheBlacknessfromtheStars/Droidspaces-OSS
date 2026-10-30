@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <glob.h>
 #include <grp.h>
 #include <limits.h>
 #include <linux/if_link.h>
@@ -57,6 +58,9 @@
 #ifndef TMPFS_MAGIC
 #define TMPFS_MAGIC 0x01021994
 #endif
+#ifndef CGROUP2_SUPER_MAGIC
+#define CGROUP2_SUPER_MAGIC 0x63677270
+#endif
 #ifndef BINDERFS_SUPER_MAGIC
 #define BINDERFS_SUPER_MAGIC 0x6c6f6f70
 #endif
@@ -69,7 +73,7 @@
 /* Constants */
 
 #define DS_PROJECT_NAME "Droidspaces"
-#define DS_VERSION "7.0.0"
+#define DS_VERSION "7.1.0"
 #define DS_MIN_KERNEL_MAJOR 3
 #define DS_MIN_KERNEL_MINOR 10
 
@@ -83,12 +87,9 @@
 #define DS_AUTHOR "ravindu644"
 #define DS_REPO "https://github.com/ravindu644/Droidspaces-OSS"
 #define DS_UUID_LEN 32
-#define DS_MAX_CONTAINERS 1024
-#define DS_STOP_TIMEOUT 15 /* seconds */
-#define DS_PID_SCAN_RETRIES 20
-#define DS_PID_SCAN_DELAY_US 200000 /* 200ms */
-#define DS_RETRY_DELAY_US 200000    /* 200ms */
-#define DS_REBOOT_EXIT 249          /* exit code: in-container reboot */
+#define DS_STOP_TIMEOUT 15       /* seconds */
+#define DS_RETRY_DELAY_US 200000 /* 200ms */
+#define DS_REBOOT_EXIT 249       /* exit code: in-container reboot */
 
 /* Workspace paths */
 #define DS_WORKSPACE_ANDROID "/data/local/Droidspaces"
@@ -96,7 +97,6 @@
 #define DS_CONTAINERS_DIR "Containers"
 #define DS_PIDS_SUBDIR "Pids"
 #define DS_IMG_MOUNT_ROOT_UNIVERSAL "/mnt/Droidspaces"
-#define DS_MAX_MOUNT_TRIES 1024
 #define DS_BIND_INITIAL_CAP 4
 #define DS_DEFAULT_INIT "/sbin/init"
 #define DS_VOLATILE_SUBDIR "Volatile"
@@ -104,10 +104,6 @@
 #define DS_NET_SUBDIR "Net"
 #define DS_ANDROID_TMPFS_CONTEXT "u:object_r:tmpfs:s0"
 #define DS_ANDROID_VOLD_CONTEXT "u:object_r:vold_data_file:s0"
-#define DS_MAX_GPU_GROUPS 32
-
-/* Device nodes to create in container /dev (when using tmpfs) */
-#define DS_CONTAINER_MARKER "droidspaces"
 
 /* Default DNS servers */
 #define DS_DNS_DEFAULT_1 "1.1.1.1"
@@ -118,10 +114,7 @@
 
 /* Common Paths & Patterns */
 #define DS_PROC_ROOT_FMT "/proc/%d/root"
-#define DS_PROC_CMDLINE_FMT "/proc/%d/cmdline"
 #define DS_PROC_STATUS_FMT "/proc/%d/status"
-#define DS_PROC_MOUNTINFO "/proc/self/mountinfo"
-#define DS_OS_RELEASE "/etc/os-release"
 #define DS_FW_PATH_FILE "/sys/module/firmware_class/parameters/path"
 #define DS_SYSTEMD_CONTAINER_MARKER "/run/systemd/container"
 #define DS_DROIDSPACES_MARKER "/run/droidspaces"
@@ -165,8 +158,6 @@
 
 /* File Extensions */
 #define DS_EXT_PID ".pid"
-#define DS_EXT_XPID ".xpid"
-#define DS_EXT_VPID ".vpid"
 #define DS_EXT_LOCK ".lock"
 
 /* Signals */
@@ -186,6 +177,8 @@
 /* Logging macros & Centralized Engine */
 
 extern int ds_log_silent;
+/* Also mutes this container's log, see ds_log_internal. */
+#define DS_LOG_PEEK 2
 extern char ds_log_container_name[256];
 extern int ds_log_container_fd;
 
@@ -204,12 +197,13 @@ int check_ns(int flag, const char *name);
 
 /* Networking modes */
 
+/* NAT is the zero value so a zeroed config already holds the default */
 enum ds_net_mode {
-  DS_NET_HOST = 0, /* share host network namespace               */
-  DS_NET_NAT,      /* isolated netns + bridge + MASQUERADE      */
-  DS_NET_NONE,     /* isolated netns with loopback only          */
-  DS_NET_GATEWAY,  /* isolated netns attached to gateway LAN     */
-  DS_NET_MACVLAN,  /* isolated netns, macvlan on a host NIC      */
+  DS_NET_NAT = 0, /* isolated netns + bridge + MASQUERADE      */
+  DS_NET_HOST,    /* share host network namespace               */
+  DS_NET_NONE,    /* isolated netns with loopback only          */
+  DS_NET_GATEWAY, /* isolated netns attached to gateway LAN     */
+  DS_NET_MACVLAN, /* isolated netns, macvlan on a host NIC      */
 };
 
 /* Opaque RTNETLINK context - defined in ds_netlink.c */
@@ -223,15 +217,9 @@ struct ds_net_handshake {
 
 /* NAT networking constants */
 
-#ifndef DS_NAT_BRIDGE
 #define DS_NAT_BRIDGE "ds-br0"
-#endif
-#ifndef DS_NAT_GW_IP
 #define DS_NAT_GW_IP "172.28.0.1"
-#endif
-#ifndef DS_NAT_PREFIX
 #define DS_NAT_PREFIX 16
-#endif
 
 /* NAT66. One ULA /48 for everything we masquerade. RFC 4193 wants the global
  * ID random; ours is fixed (64:73:70 is "dsp") for the same reason the IPv4
@@ -283,21 +271,13 @@ struct ds_net_handshake {
  * DS_RULE_PRIO_FROM_SUBNET - "from 172.28.0.0/16 lookup <gw_table>"
  *   Routes container-originated traffic through the active uplink table.
  */
-#ifndef DS_RULE_PRIO_TO_SUBNET
 #define DS_RULE_PRIO_TO_SUBNET 6090
-#endif
-#ifndef DS_RULE_PRIO_TETHER
 #define DS_RULE_PRIO_TETHER 6095
-#endif
-#ifndef DS_RULE_PRIO_FROM_SUBNET
 #define DS_RULE_PRIO_FROM_SUBNET 6100
-#endif
 
 /* netd's fixed local_network routing table
  * (RouteController::ROUTE_TABLE_LOCAL_NETWORK, constant since Android 5.x). */
-#ifndef DS_ANDROID_TABLE_LOCAL_NETWORK
 #define DS_ANDROID_TABLE_LOCAL_NETWORK 97
-#endif
 
 /* Bind mount entry */
 struct ds_bind_mount {
@@ -360,7 +340,7 @@ struct ds_config {
   /* Paths */
   char rootfs_path[PATH_MAX];        /* --rootfs=  */
   char rootfs_img_path[PATH_MAX];    /* --rootfs-img= */
-  char pidfile[PATH_MAX];            /* --pidfile= or auto-resolved */
+  char pidfile[PATH_MAX];            /* Pids/<name>.pid */
   char container_name[256];          /* --name= (mandatory) */
   char hostname[256];                /* --hostname= or container_name */
   char dns_servers[1024];            /* --dns= (comma/space separated) */
@@ -399,13 +379,15 @@ struct ds_config {
   int reboot_cycle;    /* 1 if we are in a reboot loop */
   int force_cgroupv1;  /* --force-cgroupv1: use v1 even if v2 is available */
   int privileged_mask; /* --privileged bitmask */
-  int format_output;   /* --format: JSON output (show, info) */
-  char prog_name[64];  /* argv[0] for logging */
+  /* A privileged= value with an unknown tag: the mask stays empty and this is
+   * written back as it was until a valid --privileged replaces it. */
+  char privileged_bad[256];
+  int json_output;    /* --json: JSON output (show, info, check) */
+  char prog_name[64]; /* argv[0] for logging */
 
   /* Runtime state */
   char volatile_dir[PATH_MAX]; /* temporary overlay dir */
   pid_t container_pid;         /* PID 1 of the container (host view) */
-  pid_t intermediate_pid;      /* intermediate fork pid */
   pid_t x11_pid;               /* PID of the Termux-X11 server process */
   pid_t virgl_pid;             /* PID of the VirGL server process */
   pid_t pulse_pid;             /* PID of the PulseAudio daemon process */
@@ -434,6 +416,13 @@ struct ds_config {
 
   /* Terminal (console + ttys) */
   struct ds_tty_info console;
+  /* The console travels on these socketpairs. Init allocates it from the
+   * container's own devpts and sends the pair up console_sock[1]; the monitor
+   * reads [0] and keeps a copy. A foreground start also gets the pair, over
+   * console_fwd[1]; only the start command holds console_fwd[0], so once it
+   * is gone the monitor sees end of file there and adopts the console. */
+  int console_sock[2];
+  int console_fwd[2];
 
   /* Environment variables (dynamically allocated) */
   char env_file[PATH_MAX];
@@ -483,6 +472,9 @@ char *ds_resolve_path_arg(const char *path);
 void ds_resolve_argv_paths(int argc, char **argv);
 long ds_clk_tck(void);
 long ds_get_container_uptime(pid_t pid);
+/* Field 22 of /proc/<pid>/stat in clock ticks since boot, 0 if unreadable. */
+unsigned long long proc_starttime(pid_t pid);
+const char *proc_stat_field(pid_t pid, int n, char *buf, size_t size);
 void ds_format_uptime(long uptime_sec, char *buf, size_t size);
 
 /* status.c */
@@ -495,6 +487,7 @@ struct ds_status {
   char ip[256];          /* non-loopback IPv4 addresses, comma separated */
   char ip6[512];         /* global and ULA IPv6 addresses, comma separated */
   char anland_sock[108]; /* host socket of the anland daemon, or "" */
+  int x11;               /* booted with Termux:X11 */
   long uptime_sec;
   long ram_used_kb;
   long cpu_permill;
@@ -515,7 +508,6 @@ void ds_json_int(const char *key, long long val, int *first);
 void ds_json_status(const struct ds_status *st, int *first);
 int is_ramfs(const char *path);
 int is_subpath(const char *parent, const char *child);
-int is_running_in_termux(void);
 int write_file(const char *path, const char *content);
 int read_file(const char *path, char *buf, size_t size);
 int write_file_atomic(const char *path, const char *content);
@@ -526,8 +518,6 @@ int mkdir_p(const char *path, mode_t mode);
 int remove_recursive(const char *path);
 int collect_pids(pid_t **pids_out, size_t *count_out);
 int build_proc_root_path(pid_t pid, const char *suffix, char *buf, size_t size);
-int parse_os_release(const char *rootfs_path, char *id_out, char *ver_out,
-                     size_t out_size);
 int grep_file(const char *path, const char *pattern);
 int read_and_validate_pid(const char *pidfile, pid_t *pid_out);
 void firmware_path_add(const char *fw_path);
@@ -566,9 +556,8 @@ void cleanup_container_resources(struct ds_config *cfg, pid_t pid,
                                  int skip_unmount, int force_cleanup);
 void ds_open_container_log(struct ds_config *cfg);
 void ds_close_container_log(void);
-void ds_socketd_record_core_event(const char *action,
-                                  const char *container_name, const char *uuid);
-int copy_file(const char *src, const char *dst);
+void container_log_path(const char *name, const char *file, char *buf,
+                        size_t size);
 void sort_bind_mounts(struct ds_config *cfg);
 void sanitize_container_name(const char *name, char *out, size_t size);
 int validate_container_name(const char *name);
@@ -582,12 +571,15 @@ int count_folders(const char *path);
 /* Daemon lifecycle helpers */
 typedef void (*ds_child_fn)(int ready_fd, void *user_data);
 pid_t ds_daemon_read_pid(const char *filename);
-void ds_daemon_write_pid(const char *filename, pid_t pid);
+void ds_daemon_write_pid(const char *filename, pid_t pid, const char *flags);
 void ds_daemon_remove_pid(const char *filename);
 pid_t ds_resolve_daemon_pid(pid_t cached, const char *pidfile);
 void ds_global_daemon_stop(int (*check_fn)(void), pid_t cached_pid,
                            pid_t *pid_out, const char *pidfile,
                            const char *sock_path, const char *tag);
+pid_t ds_global_daemon_reuse(int (*check_fn)(void), const char *pidfile,
+                             const char *flags, const char *sock_path,
+                             const char *tag);
 void ds_oom_protect(void);
 void ds_oom_unprotect(void);
 int ds_thread_create(pthread_t *tid, void *(*fn)(void *), void *arg);
@@ -619,14 +611,25 @@ int ds_bridge_termux_socket(const char *leaf, const char *dst,
 
 int ds_config_load(const char *config_path, struct ds_config *cfg);
 int ds_config_load_by_name(const char *name, struct ds_config *cfg);
+int ds_config_peek(const char *name, struct ds_config *cfg);
+int ds_config_peek_path(const char *config_path, struct ds_config *cfg);
 int ds_config_save(const char *config_path, struct ds_config *cfg);
 int ds_config_save_by_name(const char *name, struct ds_config *cfg);
-int ds_config_validate(struct ds_config *cfg);
 /* --net / net_mode= value to its mode, -1 if unknown. */
 int ds_parse_net_mode(const char *s);
+const char *ds_net_mode_name(enum ds_net_mode mode);
 /* --macvlan-mode / macvlan_mode= value to MACVLAN_MODE_*, 0 if unknown. */
 uint32_t ds_parse_macvlan_mode(const char *s);
 const char *ds_macvlan_mode_name(uint32_t mode);
+/* One SRC:DEST[:ro] or HOST[:CONTAINER][/proto] spec into cfg, cut up in
+ * place. 0 stored, 1 skipped as a duplicate or overlap (port forwards only,
+ * already warned about), -1 with the reason in err. */
+int ds_parse_bind_spec(char *spec, struct ds_config *cfg, char *err,
+                       size_t err_size);
+int ds_parse_port_forward(char *spec, struct ds_config *cfg, char *err,
+                          size_t err_size);
+void ds_privileged_names(int mask, char *buf, size_t size, const char *sep);
+void ds_config_init(struct ds_config *cfg);
 int ds_config_add_bind(struct ds_config *cfg, const char *src, const char *dest,
                        int ro);
 void free_config_binds(struct ds_config *cfg);
@@ -637,9 +640,8 @@ int ds_split_flags(const char *str, char ***out_argv, int *out_argc);
 void ds_free_split_flags(char **argv, int argc);
 char *ds_config_auto_path(const char *rootfs_path);
 void ds_config_reset_defaults(struct ds_config *cfg);
-void apply_reset_config(struct ds_config *cfg, int cli_net_mode_set,
-                        enum ds_net_mode cli_net_mode);
-void parse_privileged(const char *value, struct ds_config *cfg);
+void apply_reset_config(struct ds_config *cfg);
+int parse_privileged(const char *value, struct ds_config *cfg);
 
 /* android.c */
 
@@ -650,8 +652,11 @@ void ds_set_selinux_permissive(int enable);
 int ds_get_selinux_status(void);
 void android_remount_data_suid(void);
 int android_setup_storage(const char *rootfs_path);
-int android_seccomp_setup(int privileged_mask);
+int ds_seccomp_keyring_shim(int privileged_mask);
 int ds_seccomp_apply_minimal(int privileged_mask, int sandboxing_allowed);
+int ds_kernel_has_mount_api(void);
+int ds_mount_api_shim_wanted(const struct ds_config *cfg);
+int ds_seccomp_mount_api_shim(const struct ds_config *cfg);
 
 /* KernelSU container-escape hardening: ask KSU to mark the current thread
  * (TIF_KSU_DISABLE_ESCAPE_WITH_ROOT via KSU_IOCTL_DISABLE_ESCAPE_TO_ROOT)
@@ -674,8 +679,6 @@ int ds_resolve_termux_uid(void);
 
 int domount(const char *src, const char *tgt, const char *fstype,
             unsigned long flags, const char *data);
-int domount_silent(const char *src, const char *tgt, const char *fstype,
-                   unsigned long flags, const char *data);
 int bind_mount(const char *src, const char *tgt);
 int ds_stage_dev_node(const char *staging, const char *dev_dir, const char *rel,
                       mode_t mode, dev_t dev, gid_t gid);
@@ -683,7 +686,6 @@ int ds_apply_jail_mask(int hw_access, int privileged_mask, int sandboxing);
 int setup_dev(const char *rootfs, int hw_access, int gpu_mode, int allow_vts);
 int create_devices(const char *rootfs, const char *staging);
 int setup_devpts(int hw_access);
-int ds_fix_host_ptys(void);
 int setup_volatile_overlay(struct ds_config *cfg);
 int cleanup_volatile_overlay(struct ds_config *cfg);
 int check_volatile_mode(struct ds_config *cfg);
@@ -696,8 +698,6 @@ int ds_img_mount_point(const char *name, char *buf, size_t size);
 
 /* cgroup.c */
 
-int ds_cgroup_v2_usable(void);
-int ds_cgroup_kernel_supports_v2(void);
 int ds_cgroup_host_is_v2(void);
 int ds_cgroup_has_controller(const char *name);
 int setup_cgroups(int is_systemd, int force_cgroupv1);
@@ -723,13 +723,14 @@ int ds_cgroup_get_usage(const char *container_name, long long *mem,
                         long long *pids);
 long long ds_parse_size(const char *str);
 void ds_format_size(long long bytes, char *buf, size_t sz);
-/* Word-boundary controller name check (used by container.c for subtree_control
- * building; wraps the static ctrl_in_list in cgroup.c). */
-int ds_cg_word_in_list(const char *list, const char *name);
 
-/* virtualize.c */
+/* virtualize.c: the LXCFS-style views of /proc and /sys/devices/system/cpu */
 
+/* Inside the container before init execs: bind-mounts the virtual files the
+ * active limits need, no-op without limits. */
 int ds_virtualize_init(struct ds_config *cfg);
+/* From the monitor every 500 ms: rewrites the dynamic files in place so the
+ * bind-mounted inodes survive. */
 void ds_virtualize_update(struct ds_config *cfg);
 void ds_virtualize_join(pid_t init_pid);
 unsigned long ds_get_pid_ns_inode(pid_t pid);
@@ -924,7 +925,9 @@ void ds_dhcp_server_stop(void);
 
 /* terminal.c */
 
-int ds_openpty(int *master, int *slave, char *name);
+int ds_openpty(const char *ptmx, int *master, int *slave, char *name);
+int ds_console_send(int sock, int master, int slave);
+int ds_console_recv(int sock, int *master, int *slave);
 int ds_terminal_create(struct ds_tty_info *tty);
 int ds_terminal_set_stdfds(int fd);
 int ds_terminal_make_controlling(int fd);
@@ -933,7 +936,7 @@ int ds_terminal_proxy(int master_fd);
 
 /* console.c */
 
-int console_monitor_loop(int console_master_fd, pid_t monitor_pid,
+int console_monitor_loop(int console_sock, pid_t monitor_pid,
                          struct ds_config *cfg);
 
 /* pid.c */
@@ -943,17 +946,13 @@ const char *get_pids_dir(void);
 const char *get_net_dir(void);
 const char *get_logs_dir(void);
 int ensure_workspace(void);
-int generate_container_name(const char *rootfs_path, char *name, size_t size);
-int find_available_name(const char *base_name, char *final_name, size_t size);
 int resolve_pidfile_from_name(const char *name, char *pidfile, size_t size);
-int auto_resolve_pidfile(struct ds_config *cfg);
 int is_container_running(struct ds_config *cfg, pid_t *pid_out);
 int is_container_init(pid_t pid);
 int ds_metadata_sync(pid_t pid);
 int count_running_containers(char *first_name, size_t size);
 pid_t find_container_init_pid(const char *uuid);
 pid_t find_container_by_name(const char *name);
-int sync_pidfile(const char *src_pidfile, const char *name);
 int show_containers(struct ds_config *cfg);
 int scan_containers(void);
 int check_selinux_permissive_needs(void);
@@ -994,10 +993,8 @@ int enter_rootfs(struct ds_config *cfg, const char *user);
 int run_in_rootfs(struct ds_config *cfg, char **argv, const char *as_user);
 int show_info(struct ds_config *cfg, int trust_cfg_pid);
 /* argc/argv: the process's original arguments, so restart can re-apply CLI
- * overrides after its post-stop config reload. NULL argv skips that step. */
+ * overrides after its post-stop config reload. */
 int restart_rootfs(struct ds_config *cfg, int argc, char **argv);
-int restart_rootfs_with_timeout(struct ds_config *cfg, int timeout_seconds,
-                                int argc, char **argv);
 /* The CLI override pass, lives in main.c. Idempotent over the same argv. */
 int ds_apply_cli_overrides(int argc, char **argv, struct ds_config *cfg,
                            int strict);
@@ -1008,9 +1005,8 @@ void print_documentation(const char *argv0);
 
 /* check.c */
 
-int check_requirements(void);
 int check_requirements_hw(int hw_access);
-int check_requirements_detailed(int format_output);
+int check_requirements_detailed(int json_output);
 
 /* daemon.c - daemon, client, and probe entry points */
 
@@ -1020,6 +1016,7 @@ int ds_daemon_run(int foreground, char **argv);
  * want_stdin is --stdin: relay our stdin to a pipe-mode run instead of
  * handing it /dev/null. */
 int ds_client_run(int argc, char **argv, const char *cmd, int want_stdin);
+const char *ds_command_word(int argc, char **argv);
 int ds_daemon_probe(void);
 
 #endif /* DROIDSPACE_H */

@@ -270,7 +270,7 @@ int internal_boot(struct ds_config *cfg) {
   /* 4b. Force the image rootfs read-write - the single unified point covering
    * fresh boot, restart, AND internal reboot.
    *
-   * On shutdown/reboot OpenWRT remounts its root read-only, leaving our mount
+   * On shutdown/reboot OpenWrt remounts its root read-only, leaving our mount
    * point under /mnt/Droidspaces/<name> read-only too.  External and internal
    * reboots never unmount the rootfs.img (to keep restarts fast), so the next
    * boot reuses that still-read-only mount and pivot_root fails to create
@@ -304,23 +304,16 @@ int internal_boot(struct ds_config *cfg) {
     }
   }
 
-  /* 7. Pre-create standard directories in one loop to reduce syscalls */
-  const char *dirs_to_create[] = {".old_root", "proc", "sys", "run", "tmp"};
-  int dir_creation_failed = 0;
-  for (size_t i = 0; i < sizeof(dirs_to_create) / sizeof(dirs_to_create[0]);
-       i++) {
-    if (mkdir(dirs_to_create[i], 0755) < 0 && errno != EEXIST) {
-      ds_error("Failed to create '%s': %s", dirs_to_create[i], strerror(errno));
-      /* .old_root is critical for pivot_root, track if it fails */
-      if (strcmp(dirs_to_create[i], ".old_root") == 0) {
-        dir_creation_failed = 1;
-      }
-    }
-  }
-  if (dir_creation_failed) {
-    ds_error("Failed to create critical directory .old_root");
+  /* 7. pivot_root parks the old root in .old_root, so that one must exist;
+   * the rest are mountpoints a rootfs normally ships anyway. */
+  if (mkdir(".old_root", 0755) < 0 && errno != EEXIST) {
+    ds_error("Failed to create .old_root: %s", strerror(errno));
     goto boot_fail;
   }
+  const char *dirs[] = {"proc", "sys", "run", "tmp"};
+  for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+    if (mkdir(dirs[i], 0755) < 0 && errno != EEXIST)
+      ds_error("Failed to create '%s': %s", dirs[i], strerror(errno));
 
   /* 8. Setup /dev (device nodes, devtmpfs) */
   if (setup_dev(".", cfg->hw_access, cfg->gpu_mode, cfg->allow_vts) < 0) {
@@ -434,11 +427,6 @@ int internal_boot(struct ds_config *cfg) {
   if (domount("tmpfs", "tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777") < 0)
     ds_warn("Failed to mount tmpfs at /tmp: %s", strerror(errno));
 
-  /* 14. Bind-mount console BEFORE pivot_root (host pts still visible). */
-  if (mount(cfg->console.name, "dev/console", NULL, MS_BIND, NULL) < 0)
-    ds_warn("Failed to bind mount console '%s': %s", cfg->console.name,
-            strerror(errno));
-
   /* 15. Android-specific storage */
   if (cfg->android_storage) {
     android_setup_storage(".");
@@ -491,6 +479,43 @@ int internal_boot(struct ds_config *cfg) {
 
   /* 18. Setup devpts (must be after pivot_root for newinstance) */
   setup_devpts(cfg->hw_access);
+
+  /* 18a. The console, from the devpts just mounted: a pty taken from the host
+   * sat root-owned in the host's /dev/pts for the container's whole life
+   * (#369). /dev/ptmx is the fallback for a kernel without newinstance
+   * support, where setup_devpts left nothing of our own to allocate from.
+   * Bound by fd, since by name /dev/pts/N could resolve into the wrong
+   * instance on the setup_devpts fallbacks. The caller's terminal is still
+   * our stdin here, so its size goes on before anything is printed. */
+  struct ds_tty_info con = {.master = -1, .slave = -1};
+  int console_slave = -1; /* step 24 takes it when the bind below fails */
+  if (ds_openpty("/dev/pts/ptmx", &con.master, &con.slave, con.name) < 0 &&
+      ds_openpty("/dev/ptmx", &con.master, &con.slave, con.name) < 0) {
+    ds_warn("Failed to allocate console PTY: %s", strerror(errno));
+  } else {
+    struct winsize ws;
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
+      ioctl(con.master, TIOCSWINSZ, &ws);
+    fchmod(con.slave, 0620);
+    if (fchown(con.slave, 0, DS_DEFAULT_TTY_GID) < 0) {
+      /* best-effort */
+    }
+    char src[64];
+    snprintf(src, sizeof(src), "/proc/self/fd/%d", con.slave);
+    if (mount(src, "/dev/console", NULL, MS_BIND, NULL) < 0 &&
+        mount(con.name, "/dev/console", NULL, MS_BIND, NULL) < 0) {
+      /* A pty from the host's instance cannot be bound in here (a cross
+       * namespace bind is EINVAL before 5.2), so init takes the fd itself. */
+      ds_warn("Failed to bind mount console '%s': %s", con.name,
+              strerror(errno));
+      console_slave = con.slave;
+    }
+    if (ds_console_send(cfg->console_sock[1], con.master, con.slave) < 0)
+      ds_warn("Failed to hand the console to the monitor: %s", strerror(errno));
+    close(con.master);
+    if (console_slave < 0)
+      close(con.slave);
+  }
 
   /* Apply jail mask after pivot_root for correct path resolution */
   ds_apply_jail_mask(cfg->hw_access, cfg->privileged_mask,
@@ -584,13 +609,15 @@ int internal_boot(struct ds_config *cfg) {
    * Best-effort, silent no-op on non-KSU kernels. */
   ds_ksu_neutralize_root_escape();
   ds_seccomp_apply_minimal(cfg->privileged_mask, cfg->sandboxing_allowed);
-  android_seccomp_setup(cfg->privileged_mask);
+  ds_seccomp_keyring_shim(cfg->privileged_mask);
+  ds_seccomp_mount_api_shim(cfg);
 
   ds_apply_capability_hardening(cfg->hw_access, cfg->privileged_mask,
                                 cfg->sandboxing_allowed);
 
   /* 24. Redirect standard I/O to /dev/console */
-  int console_fd = open("/dev/console", O_RDWR);
+  int console_fd =
+      console_slave >= 0 ? console_slave : open("/dev/console", O_RDWR);
   if (console_fd >= 0) {
     if (ds_terminal_set_stdfds(console_fd) < 0) {
       ds_warn("Failed to redirect stdio to /dev/console");
@@ -637,9 +664,6 @@ int internal_boot(struct ds_config *cfg) {
    *   cgroup2fs  → unified (v2 only)  → unified_cgroup_hierarchy=1
    *   tmpfs      → legacy / hybrid    → unified_cgroup_hierarchy=0
    * This is exactly what LXC does via lxc.init.cmd. */
-#ifndef CGROUP2_SUPER_MAGIC
-#define CGROUP2_SUPER_MAGIC 0x63677270
-#endif
   if (is_systemd && !cfg->custom_init[0]) {
     struct statfs _cgsfs;
     if (statfs("/sys/fs/cgroup", &_cgsfs) == 0) {
@@ -653,6 +677,11 @@ int internal_boot(struct ds_config *cfg) {
       }
     }
     /* statfs failure → leave systemd to probe on its own */
+
+    /* libmount treats the shim's EPERM as fatal, see
+     * ds_seccomp_mount_api_shim. */
+    if (ds_mount_api_shim_wanted(cfg))
+      init_args[argc++] = (char *)"systemd.setenv=LIBMOUNT_FORCE_MOUNT2=always";
   }
 
   init_args[argc] = NULL;

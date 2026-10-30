@@ -21,6 +21,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -32,7 +33,6 @@ import com.droidspaces.app.ui.component.DroidspacesStatus
 import com.droidspaces.app.ui.component.DroidspacesStatusCard
 import com.droidspaces.app.ui.component.SystemInfoCard
 import com.droidspaces.app.util.DroidspacesBackendStatus
-import com.droidspaces.app.util.PreferencesManager
 import com.droidspaces.app.util.SystemInfoManager
 import com.droidspaces.app.ui.viewmodel.AppStateViewModel
 import com.droidspaces.app.ui.viewmodel.ContainerViewModel
@@ -131,7 +131,7 @@ fun MainTabScreen(
 
             // Proactive recovery on first launch: Always run scan if backend available
             if (appStateViewModel.isBackendAvailable) {
-                containerViewModel.runScan()
+                containerViewModel.scan(showIndicator = true)
             } else {
                 // If not available immediately, ensure we fetch when it does become available
                 containerViewModel.fetchContainerList()
@@ -144,9 +144,9 @@ fun MainTabScreen(
         if (appStateViewModel.isBackendAvailable) {
             // Re-probe only after a reboot or a backend update, the cache covers the rest.
             HostCapabilities.refreshIfStale(context)
-            // Because runScan might be running, fetchContainerList is safe because it only
+            // Because scan might be running, fetchContainerList is safe because it only
             // cancels previous fetch jobs, and runs concurrently (which is fine, UI populates fast).
-            // We only trigger this if it's currently empty, to avoid double-fetching if runScan succeeded,
+            // We only trigger this if it's currently empty, to avoid double-fetching if scan succeeded,
             // or just always run it since it's cheap and ensures sync.
             if (containerViewModel.containerList.isEmpty()) {
                 containerViewModel.fetchContainerList()
@@ -154,66 +154,20 @@ fun MainTabScreen(
         }
     }
 
-    // Map backend status to UI status - remember previous status to prevent glitches
+    // The card keeps the last settled status through a Checking pass, which is what
+    // stops it flickering during a refresh; the ViewModel already seeds that from the
+    // cached status, so a cold start shows the right card at once.
     val currentBackendStatus = appStateViewModel.backendStatus
-    val prefsManager = remember { PreferencesManager.getInstance(context) }
-
-    // Initialize stable status from cached backend status to prevent initial boot glitch
-    val stableDroidspacesStatus = remember {
-        mutableStateOf<DroidspacesStatus?>(
-            prefsManager.cachedBackendStatus?.let { cached ->
-                when (cached) {
-                    "UpdateAvailable" -> DroidspacesStatus.UpdateAvailable
-                    "NotInstalled" -> DroidspacesStatus.NotInstalled
-                    "Corrupted" -> DroidspacesStatus.Corrupted
-                    "ModuleMissing" -> DroidspacesStatus.ModuleMissing
-                    "" -> DroidspacesStatus.Working
-                    else -> null
-                }
-            }
-        )
+    var stableDroidspacesStatus by remember { mutableStateOf(currentBackendStatus.toUi()) }
+    LaunchedEffect(currentBackendStatus) {
+        currentBackendStatus.toUi()?.let { stableDroidspacesStatus = it }
     }
-
-    // Track previous root status to detect when root becomes unavailable
-    var previousRootAvailable by remember { mutableStateOf(appStateViewModel.isRootAvailable) }
-
-    // Update stable status when backend status changes (but skip Checking to prevent flicker)
-    LaunchedEffect(currentBackendStatus, appStateViewModel.isRootAvailable) {
-        // Skip updates during Checking state to prevent flicker during refresh
-        if (currentBackendStatus is DroidspacesBackendStatus.Checking) {
-            return@LaunchedEffect
-        }
-
-        val newStatus = when (currentBackendStatus) {
-            is DroidspacesBackendStatus.Available -> DroidspacesStatus.Working
-            is DroidspacesBackendStatus.UpdateAvailable -> DroidspacesStatus.UpdateAvailable
-            is DroidspacesBackendStatus.NotInstalled -> DroidspacesStatus.NotInstalled
-            is DroidspacesBackendStatus.Corrupted -> DroidspacesStatus.Corrupted
-            is DroidspacesBackendStatus.ModuleMissing -> DroidspacesStatus.ModuleMissing
-            is DroidspacesBackendStatus.Checking -> return@LaunchedEffect // Already handled above
-        }
-
-        // Always update stable status when we have a non-Checking status
-        // This allows updates from error to working (e.g., after installation)
-        stableDroidspacesStatus.value = newStatus
-
-        previousRootAvailable = appStateViewModel.isRootAvailable
-    }
-
-    // Use stable status if available, otherwise compute from current status
-    val droidspacesStatus: DroidspacesStatus = stableDroidspacesStatus.value ?: when (currentBackendStatus) {
-        is DroidspacesBackendStatus.Checking -> DroidspacesStatus.Working
-        is DroidspacesBackendStatus.Available -> DroidspacesStatus.Working
-        is DroidspacesBackendStatus.UpdateAvailable -> DroidspacesStatus.UpdateAvailable
-        is DroidspacesBackendStatus.NotInstalled -> DroidspacesStatus.NotInstalled
-        is DroidspacesBackendStatus.Corrupted -> DroidspacesStatus.Corrupted
-        is DroidspacesBackendStatus.ModuleMissing -> DroidspacesStatus.ModuleMissing
-    }
+    val droidspacesStatus: DroidspacesStatus = stableDroidspacesStatus ?: DroidspacesStatus.Working
 
     // UI state from ViewModels
     val isBackendAvailable = appStateViewModel.isBackendAvailable
     // Only show checking on initial load when we don't have cached status
-    val isChecking = !appStateViewModel.hasCompletedInitialCheck && stableDroidspacesStatus.value == null
+    val isChecking = !appStateViewModel.hasCompletedInitialCheck && stableDroidspacesStatus == null
     val containerCount = containerViewModel.containerCount
     val runningCount = containerViewModel.runningCount
 
@@ -225,17 +179,17 @@ fun MainTabScreen(
         // Check root status first (in case user denied root access)
         appStateViewModel.checkRootStatus()
         // Then refresh backend status
-        appStateViewModel.forceRefresh()
+        appStateViewModel.checkBackendStatus(force = true)
         // Force refresh droidspaces version to get latest after backend updates
         if (appStateViewModel.isBackendAvailable) {
-            SystemInfoManager.refreshDroidspacesVersion(context)
-            SystemInfoManager.refreshBackendMode(context)
+            SystemInfoManager.getDroidspacesVersion(context, force = true)
+            SystemInfoManager.getBackendMode(context, force = true)
             HostCapabilities.refresh(context)
 
             when (tab) {
                 TabItem.Home, TabItem.Containers -> {
                     // Home/Containers: Always run a full scan on refresh for maximum visibility
-                    containerViewModel.runScan()
+                    containerViewModel.scan(showIndicator = true)
                 }
                 TabItem.ControlPanel -> {
                     // Control Panel: snappy refresh, but background recovery
@@ -246,7 +200,7 @@ fun MainTabScreen(
 
                     if (!anyRunning) {
                         // Metadata missing for running containers? attempt foreground recovery
-                        containerViewModel.runScan()
+                        containerViewModel.scan(showIndicator = true)
                     } else {
                         // Running containers found, update UI normally (snappy)
                         withContext(Dispatchers.Main) {
@@ -254,7 +208,7 @@ fun MainTabScreen(
                         }
                         // Then scan in background silently to catch orphans
                         scope.launch {
-                            containerViewModel.silentScan()
+                            containerViewModel.scan(showIndicator = false)
                         }
                     }
                 }
@@ -339,32 +293,34 @@ fun MainTabScreen(
                     }
 
                     TabItem.Containers -> {
-                        ContainersTabContent(
-                            isBackendAvailable = isBackendAvailable,
-                            isRootAvailable = appStateViewModel.isRootAvailable,
-                            isKernelSupported = isKernelSupported,
-                            onNavigateToInstallation = onNavigateToContainerInstallation,
-                            onNavigateToEditContainer = onNavigateToEditContainer,
-                            onNavigateToContainerDetails = onNavigateToContainerDetails,
-                            containerViewModel = containerViewModel,
-                            onRefresh = { performRefresh(TabItem.Containers) },
-                            expandedContainerName = expandedContainerName,
-                            onExpandedContainerNameChange = { expandedContainerName = it },
-                            bottomBarInset = bottomBarHeight
-                        )
+                        PullToRefreshWrapper(onRefresh = { performRefresh(TabItem.Containers) }) {
+                            ContainersScreen(
+                                isBackendAvailable = isBackendAvailable,
+                                isRootAvailable = appStateViewModel.isRootAvailable,
+                                isKernelSupported = isKernelSupported,
+                                onNavigateToInstallation = onNavigateToContainerInstallation,
+                                onNavigateToEditContainer = onNavigateToEditContainer,
+                                onNavigateToContainerDetails = onNavigateToContainerDetails,
+                                containerViewModel = containerViewModel,
+                                expandedContainerName = expandedContainerName,
+                                onExpandedContainerNameChange = { expandedContainerName = it },
+                                bottomBarInset = bottomBarHeight
+                            )
+                        }
                     }
 
                     TabItem.ControlPanel -> {
-                        ControlPanelTabContent(
-                            isBackendAvailable = isBackendAvailable,
-                            isRootAvailable = appStateViewModel.isRootAvailable,
-                            isKernelSupported = isKernelSupported,
-                            containerViewModel = containerViewModel,
-                            onRefresh = { performRefresh(TabItem.ControlPanel) },
-                            onNavigateToContainerDetails = onNavigateToContainerDetails,
-                            onNavigateToTerminal = onNavigateToTerminal,
-                            bottomBarInset = bottomBarHeight
-                        )
+                        PullToRefreshWrapper(onRefresh = { performRefresh(TabItem.ControlPanel) }) {
+                            ControlPanelScreen(
+                                isBackendAvailable = isBackendAvailable,
+                                isRootAvailable = appStateViewModel.isRootAvailable,
+                                isKernelSupported = isKernelSupported,
+                                containerViewModel = containerViewModel,
+                                onNavigateToContainerDetails = onNavigateToContainerDetails,
+                                onNavigateToTerminal = onNavigateToTerminal,
+                                bottomBarInset = bottomBarHeight
+                            )
+                        }
                     }
                 }
             }
@@ -441,7 +397,6 @@ private fun HomeTabContent(
                         return@DroidspacesStatusCard
                     }
                     if (droidspacesStatus == DroidspacesStatus.NotInstalled ||
-                        droidspacesStatus == DroidspacesStatus.Corrupted ||
                         droidspacesStatus == DroidspacesStatus.UpdateAvailable ||
                         droidspacesStatus == DroidspacesStatus.ModuleMissing
                     ) {
@@ -479,82 +434,10 @@ private fun HomeTabContent(
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
                     // Container count card
-                    Surface(
-                        onClick = onNavigateToContainers,
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(140.dp),
-                        shape = RoundedCornerShape(24.dp), // Slightly more rounded for home cards
-                        color = MaterialTheme.colorScheme.surfaceContainer,
-                        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(16.dp),
-                            horizontalAlignment = Alignment.Start,
-                            verticalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Layers,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(28.dp)
-                            )
-                            Column {
-                                Text(
-                                    text = containerCount.toString(),
-                                    style = MaterialTheme.typography.headlineMedium,
-                                    fontWeight = FontWeight.Black
-                                )
-                                Text(
-                                    text = context.getString(R.string.containers).uppercase(),
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                                    letterSpacing = 1.sp
-                                )
-                            }
-                        }
-                    }
+                    CountCard(Icons.Default.Layers, MaterialTheme.colorScheme.primary, containerCount, context.getString(R.string.containers), onNavigateToContainers, Modifier.weight(1f))
 
                     // Running count card
-                    Surface(
-                        onClick = onNavigateToControlPanel,
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(140.dp),
-                        shape = RoundedCornerShape(24.dp),
-                        color = MaterialTheme.colorScheme.surfaceContainer,
-                        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(16.dp),
-                            horizontalAlignment = Alignment.Start,
-                            verticalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.PlayCircle,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.secondary,
-                                modifier = Modifier.size(28.dp)
-                            )
-                            Column {
-                                Text(
-                                    text = runningCount.toString(),
-                                    style = MaterialTheme.typography.headlineMedium,
-                                    fontWeight = FontWeight.Black
-                                )
-                                Text(
-                                    text = context.getString(R.string.running).uppercase(),
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                                    letterSpacing = 1.sp
-                                )
-                            }
-                        }
-                    }
+                    CountCard(Icons.Default.PlayCircle, MaterialTheme.colorScheme.secondary, runningCount, context.getString(R.string.running), onNavigateToControlPanel, Modifier.weight(1f))
                 }
 
                 Spacer(modifier = Modifier.height(6.dp))
@@ -571,62 +454,32 @@ private fun HomeTabContent(
     }
 }
 
+/** One of the two 140dp count tiles on Home, leading to the tab it counts. */
 @Composable
-private fun ContainersTabContent(
-    isBackendAvailable: Boolean,
-    isRootAvailable: Boolean,
-    isKernelSupported: Boolean,
-    onNavigateToInstallation: (android.net.Uri) -> Unit,
-    onNavigateToEditContainer: (String) -> Unit,
-    onNavigateToContainerDetails: (String) -> Unit,
-    containerViewModel: ContainerViewModel,
-    onRefresh: suspend () -> Unit,
-    expandedContainerName: String?,
-    onExpandedContainerNameChange: (String?) -> Unit,
-    bottomBarInset: Dp = 0.dp
-) {
-    PullToRefreshWrapper(onRefresh = { onRefresh() }) {
-        ContainersScreen(
-            isBackendAvailable = isBackendAvailable,
-            isRootAvailable = isRootAvailable,
-            isKernelSupported = isKernelSupported,
-            onNavigateToInstallation = onNavigateToInstallation,
-            onNavigateToEditContainer = onNavigateToEditContainer,
-            onNavigateToContainerDetails = onNavigateToContainerDetails,
-            containerViewModel = containerViewModel,
-            expandedContainerName = expandedContainerName,
-            onExpandedContainerNameChange = onExpandedContainerNameChange,
-            bottomBarInset = bottomBarInset
-        )
-    }
-}
-
-@Composable
-private fun ControlPanelTabContent(
-    isBackendAvailable: Boolean,
-    isRootAvailable: Boolean,
-    isKernelSupported: Boolean,
-    containerViewModel: ContainerViewModel,
-    onRefresh: suspend () -> Unit,
-    onNavigateToContainerDetails: (String) -> Unit,
-    onNavigateToTerminal: (String) -> Unit,
-    bottomBarInset: Dp = 0.dp
-) {
-    var refreshTrigger by remember { mutableStateOf(0) }
-
-    PullToRefreshWrapper(onRefresh = {
-        onRefresh()
-        refreshTrigger++
-    }) {
-        ControlPanelScreen(
-            isBackendAvailable = isBackendAvailable,
-            isRootAvailable = isRootAvailable,
-            isKernelSupported = isKernelSupported,
-            containerViewModel = containerViewModel,
-            onNavigateToContainerDetails = onNavigateToContainerDetails,
-            onNavigateToTerminal = onNavigateToTerminal,
-            bottomBarInset = bottomBarInset
-        )
+private fun CountCard(icon: ImageVector, tint: Color, count: Int, label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    Surface(
+        onClick = onClick,
+        modifier = modifier.height(140.dp),
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(16.dp),
+            horizontalAlignment = Alignment.Start,
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
+            Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(28.dp))
+            Column {
+                Text(count.toString(), style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Black)
+                Text(
+                    label.uppercase(),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                    letterSpacing = 1.sp
+                )
+            }
+        }
     }
 }
 
@@ -724,4 +577,13 @@ private fun MainBottomBar(
             Spacer(modifier = Modifier.navigationBarsPadding())
         }
     }
+}
+
+/** The home card's view of the backend; null for Checking, which keeps the last one. */
+private fun DroidspacesBackendStatus.toUi(): DroidspacesStatus? = when (this) {
+    DroidspacesBackendStatus.Checking -> null
+    DroidspacesBackendStatus.Available -> DroidspacesStatus.Working
+    DroidspacesBackendStatus.UpdateAvailable -> DroidspacesStatus.UpdateAvailable
+    DroidspacesBackendStatus.NotInstalled -> DroidspacesStatus.NotInstalled
+    DroidspacesBackendStatus.ModuleMissing -> DroidspacesStatus.ModuleMissing
 }

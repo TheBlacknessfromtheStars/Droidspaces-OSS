@@ -43,62 +43,6 @@ int ensure_workspace(void) {
   return 0;
 }
 
-/* Container Naming */
-
-int generate_container_name(const char *rootfs_path, char *name, size_t size) {
-  char id[64], version[64];
-
-  if (parse_os_release(rootfs_path, id, version, sizeof(id)) < 0) {
-    /* Fallback if os-release is missing */
-    safe_strncpy(name, "linux-container", size);
-    return 0;
-  }
-
-  if (version[0])
-    snprintf(name, size, "%s-%s", id, version);
-  else
-    safe_strncpy(name, id, size);
-
-  return 0;
-}
-
-int find_available_name(const char *base_name, char *final_name, size_t size) {
-  char pidfile[PATH_MAX];
-  safe_strncpy(final_name, base_name, size);
-
-  for (int i = 0; i < DS_MAX_CONTAINERS; i++) {
-    if (i > 0) {
-      size_t base_len = strlen(base_name);
-      char suffix[16];
-      int suffix_len = snprintf(suffix, sizeof(suffix), "-%d", i);
-
-      if (base_len + suffix_len < size) {
-        memcpy(final_name, base_name, base_len);
-        memcpy(final_name + base_len, suffix, suffix_len);
-        final_name[base_len + suffix_len] = '\0';
-      } else {
-        /* Truncate base_name to fit the suffix */
-        size_t max_base = size - suffix_len - 1;
-        memcpy(final_name, base_name, max_base);
-        memcpy(final_name + max_base, suffix, suffix_len);
-        final_name[size - 1] = '\0';
-      }
-    }
-
-    resolve_pidfile_from_name(final_name, pidfile, sizeof(pidfile));
-    if (access(pidfile, F_OK) != 0)
-      return 0;
-
-    /* Check if it's a stale pidfile - reuse the name slot without
-     * unlinking (the next start will overwrite it). */
-    pid_t pid;
-    if (read_and_validate_pid(pidfile, &pid) < 0) {
-      return 0;
-    }
-  }
-  return -1;
-}
-
 static int is_pid_file(const char *name) {
   if (!name)
     return 0;
@@ -212,72 +156,35 @@ static void prune_stale_pidfile(const char *name, const char *pidfile) {
   ds_container_unlock(lock_fd);
 }
 
+/* The next running container in a Pids/ directory scan, pruning the stale
+ * pidfiles it passes. 1 with cfg and pid filled in, 0 at the end. */
+static int next_running(DIR *d, struct ds_config *cfg, pid_t *pid) {
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (!is_pid_file(ent->d_name))
+      continue;
+    ds_config_init(cfg);
+    resolve_scanned_container(ent->d_name, cfg);
+    if (is_container_running(cfg, pid))
+      return 1;
+    if (*pid == 0 && access(cfg->pidfile, F_OK) == 0)
+      prune_stale_pidfile(cfg->container_name, cfg->pidfile);
+  }
+  return 0;
+}
+
 int count_running_containers(char *first_name, size_t size) {
   DIR *d = opendir(get_pids_dir());
   if (!d)
     return 0;
-
-  struct dirent *ent;
+  struct ds_config c;
+  pid_t pid;
   int count = 0;
-
-  while ((ent = readdir(d)) != NULL) {
-    if (is_pid_file(ent->d_name)) {
-      struct ds_config tmp_cfg = {0};
-      resolve_scanned_container(ent->d_name, &tmp_cfg);
-
-      pid_t pid;
-      if (is_container_running(&tmp_cfg, &pid)) {
-        if (count == 0 && first_name && size > 0) {
-          safe_strncpy(first_name, tmp_cfg.container_name, size);
-        }
-        count++;
-      } else if (pid == 0 && access(tmp_cfg.pidfile, F_OK) == 0) {
-        prune_stale_pidfile(tmp_cfg.container_name, tmp_cfg.pidfile);
-      }
-    }
-  }
+  while (next_running(d, &c, &pid))
+    if (count++ == 0 && first_name && size > 0)
+      safe_strncpy(first_name, c.container_name, size);
   closedir(d);
   return count;
-}
-
-int auto_resolve_pidfile(struct ds_config *cfg) {
-  /* 1. If pidfile is explicitly provided, resolve name from it if needed */
-  if (cfg->pidfile[0]) {
-    if (cfg->container_name[0] == '\0') {
-      char *base = strrchr(cfg->pidfile, '/');
-      base = base ? base + 1 : cfg->pidfile;
-      safe_strncpy(cfg->container_name, base, sizeof(cfg->container_name));
-      char *dot = strrchr(cfg->container_name, '.');
-      if (dot)
-        *dot = '\0';
-    }
-    return 0;
-  }
-
-  /* 2. If name is provided, resolve pidfile from it */
-  if (cfg->container_name[0]) {
-    resolve_pidfile_from_name(cfg->container_name, cfg->pidfile,
-                              sizeof(cfg->pidfile));
-    return 0;
-  }
-
-  /* 3. Otherwise, look for the ONLY running container */
-  char found_name[256];
-  int count = count_running_containers(found_name, sizeof(found_name));
-
-  if (count == 1) {
-    safe_strncpy(cfg->container_name, found_name, sizeof(cfg->container_name));
-    resolve_pidfile_from_name(found_name, cfg->pidfile, sizeof(cfg->pidfile));
-    return 0;
-  }
-
-  if (count > 1) {
-    ds_error("Multiple containers running. Please specify --name.");
-    return -1;
-  }
-
-  ds_error("No containers running.");
-  return -1;
 }
 
 /* PID Discovery (UUID Scan) */
@@ -363,17 +270,6 @@ pid_t find_container_by_name(const char *name) {
   return 0;
 }
 
-int sync_pidfile(const char *src_pidfile, const char *name) {
-  char dst[PATH_MAX];
-  if (resolve_pidfile_from_name(name, dst, sizeof(dst)) < 0)
-    return -1;
-
-  char buf[64];
-  if (read_file(src_pidfile, buf, sizeof(buf)) < 0)
-    return -1;
-  return write_file(dst, buf);
-}
-
 /* Status reporting */
 
 int show_containers(struct ds_config *cfg) {
@@ -396,20 +292,9 @@ int show_containers(struct ds_config *cfg) {
     return -1;
   }
 
-  struct dirent *ent;
-  while (d && (ent = readdir(d)) != NULL) {
-    if (!is_pid_file(ent->d_name))
-      continue;
-    struct ds_config tmp_cfg = {0};
-    resolve_scanned_container(ent->d_name, &tmp_cfg);
-
-    pid_t pid;
-    if (!is_container_running(&tmp_cfg, &pid)) {
-      if (pid == 0 && access(tmp_cfg.pidfile, F_OK) == 0)
-        prune_stale_pidfile(tmp_cfg.container_name, tmp_cfg.pidfile);
-      continue;
-    }
-
+  struct ds_config tmp_cfg;
+  pid_t pid;
+  while (d && next_running(d, &tmp_cfg, &pid)) {
     if (count >= cap) {
       struct ds_status *tmp =
           cap > 8192 ? NULL
@@ -433,12 +318,13 @@ int show_containers(struct ds_config *cfg) {
     char snap[PATH_MAX];
     if (build_proc_root_path(pid, "/run/droidspaces/container.config", snap,
                              sizeof(snap)) == 0 &&
-        ds_config_load(snap, &tmp_cfg) == 0) {
+        ds_config_peek_path(snap, &tmp_cfg) == 0) {
       safe_strncpy(st->name, tmp_cfg.container_name, sizeof(st->name));
       safe_strncpy(st->hostname, tmp_cfg.hostname, sizeof(st->hostname));
       ds_anland_load_sock(&tmp_cfg);
       safe_strncpy(st->anland_sock, tmp_cfg.anland_sock,
                    sizeof(st->anland_sock));
+      st->x11 = tmp_cfg.x11;
     }
     ds_config_free(&tmp_cfg);
     if (!st->hostname[0])
@@ -450,7 +336,7 @@ int show_containers(struct ds_config *cfg) {
   if (d)
     closedir(d);
 
-  if (cfg->format_output) {
+  if (cfg->json_output) {
     long ram_total = ds_collect_status(containers, count);
     printf("{\"total\":%d,\"ram_total_kb\":%ld,\"running\":[", totalcount,
            ram_total);
@@ -592,7 +478,7 @@ int ds_metadata_sync(pid_t pid) {
   build_proc_root_path(pid, "/run/droidspaces/container.config", path,
                        sizeof(path));
 
-  if (ds_config_load(path, &recovery_cfg) == 0) {
+  if (ds_config_peek_path(path, &recovery_cfg) == 0) {
     snprintf(recovery_cfg.config_file, sizeof(recovery_cfg.config_file),
              "%.3800s/container.config", container_dir);
 
@@ -749,7 +635,7 @@ int ds_feature_needs(size_t cfg_flag_offset) {
     char name[256];
     get_container_name_from_pidfile(ent->d_name, name, sizeof(name));
     struct ds_config tmp = {0};
-    if (ds_config_load_by_name(name, &tmp) == 0) {
+    if (ds_config_peek(name, &tmp) == 0) {
       int flag = *(int *)((char *)&tmp + cfg_flag_offset);
       pid_t pid;
       int running = flag && is_container_running(&tmp, &pid);
@@ -775,7 +661,7 @@ int ds_feature_needs(size_t cfg_flag_offset) {
     if (ent->d_name[0] == '.')
       continue;
     struct ds_config tmp = {0};
-    if (ds_config_load_by_name(ent->d_name, &tmp) == 0) {
+    if (ds_config_peek(ent->d_name, &tmp) == 0) {
       int flag = *(int *)((char *)&tmp + cfg_flag_offset);
       if (flag) {
         installed = 1;

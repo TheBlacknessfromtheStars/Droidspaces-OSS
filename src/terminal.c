@@ -10,11 +10,13 @@
 
 /* PTY Allocation */
 
-/* Open master + slave without relying on /dev/ptmx symlink resolution.
+/* Open master + slave from the ptmx node given. "/dev/ptmx" on the host;
+ * inside a container "/dev/pts/ptmx", which is the newinstance node whatever
+ * setup_devpts had to fall back to for /dev/ptmx itself.
  * TIOCGPTPEER (4.13+) opens slave directly from master fd.
  * Falls back to TIOCGPTN + path open for kernel 3.x. */
-int ds_openpty(int *master, int *slave, char *name) {
-  int m = open("/dev/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC);
+int ds_openpty(const char *ptmx, int *master, int *slave, char *name) {
+  int m = open(ptmx, O_RDWR | O_NOCTTY | O_CLOEXEC);
   if (m < 0)
     return -1;
 
@@ -54,8 +56,32 @@ err:
   return -1;
 }
 
+/* The console pair on its way from container init to the monitor, or to a
+ * foreground start. Both fds travel together so the holder keeps the slave
+ * open too: with no slave open the master hangs up, and the session would end
+ * between an init's death and the next cycle's pair arriving. */
+int ds_console_send(int sock, int master, int slave) {
+  int fds[2] = {master, slave};
+  return ds_send_fds(sock, "FD", 2, fds, 2);
+}
+
+int ds_console_recv(int sock, int *master, int *slave) {
+  char tag[2];
+  int fds[2], count;
+  if (ds_recv_fds(sock, tag, sizeof(tag), fds, 2, &count) < 0)
+    return -1;
+  if (count != 2) {
+    for (int i = 0; i < count; i++)
+      close(fds[i]);
+    return -1;
+  }
+  *master = fds[0];
+  *slave = fds[1];
+  return 0;
+}
+
 int ds_terminal_create(struct ds_tty_info *tty) {
-  if (ds_openpty(&tty->master, &tty->slave, tty->name) < 0) {
+  if (ds_openpty("/dev/ptmx", &tty->master, &tty->slave, tty->name) < 0) {
     ds_error("openpty failed: %s", strerror(errno));
     return -1;
   }
@@ -109,25 +135,19 @@ int ds_setup_tios(int fd, struct termios *old) {
 
   new_tios = *old;
 
-  /* Raw mode - mirroring LXC/SSH settings for best compatibility */
+  /* Raw mode as LXC and SSH set it: cfmakeraw, which also forces 8N1 and
+   * drops break handling (both moot on a pty), plus the flow-control and
+   * job-control bits it leaves alone. OPOST goes with it: with ONLCR active
+   * on the host PTY the line discipline would turn \n into \r\n and corrupt
+   * TUI escape sequences from tmux, vim, etc. The container shell sets its
+   * own ONLCR on the inner slave, so the translation happens exactly once. */
+  cfmakeraw(&new_tios);
   new_tios.c_iflag |= IGNPAR;
-  new_tios.c_iflag &=
-      (tcflag_t) ~(ISTRIP | INLCR | IGNCR | ICRNL | IXON | IXANY | IXOFF);
+  new_tios.c_iflag &= (tcflag_t) ~(IXANY | IXOFF);
 #ifdef IUCLC
   new_tios.c_iflag &= (tcflag_t)~IUCLC;
 #endif
-  new_tios.c_lflag &=
-      (tcflag_t) ~(TOSTOP | ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHONL);
-#ifdef IEXTEN
-  new_tios.c_lflag &= (tcflag_t)~IEXTEN;
-#endif
-  /* Disable output processing: OPOST with ONLCR active on the host PTY causes
-   * the line discipline to transform \n -> \r\n, corrupting TUI escape
-   * sequences from tmux, vim, etc. The container shell sets its own ONLCR on
-   * the inner slave, so \r\n translation happens exactly once, there. */
-  new_tios.c_oflag &= (tcflag_t) ~(OPOST | ONLCR);
-  new_tios.c_cc[VMIN] = 1;
-  new_tios.c_cc[VTIME] = 0;
+  new_tios.c_lflag &= (tcflag_t) ~(TOSTOP | ECHOE | ECHOK);
 
   if (tcsetattr(fd, TCSAFLUSH, &new_tios) < 0)
     return -1;

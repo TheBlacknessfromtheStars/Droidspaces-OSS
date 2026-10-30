@@ -10,7 +10,6 @@ output/
 *.config
 .cache
 .claude
-Android/app/src/main/assets/binaries/
 
 # Keystores
 *.keystore
@@ -25,3 +24,5 @@ compile_commands.json
 
 # Android stuff
 .gradle
+# Python
+__pycache__/

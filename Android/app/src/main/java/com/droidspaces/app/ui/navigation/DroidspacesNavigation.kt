@@ -41,22 +41,17 @@ import com.droidspaces.app.ui.screen.UnitDetailScreen
 import com.droidspaces.app.ui.screen.OverrideEditorScreen
 import com.droidspaces.app.ui.screen.ProcdScreen
 import com.droidspaces.app.ui.screen.OpenRCScreen
+import com.droidspaces.app.ui.screen.RunitScreen
 import com.droidspaces.app.ui.screen.ContainerTerminalScreen
 import com.droidspaces.app.ui.viewmodel.ContainerInstallationViewModel
 import com.droidspaces.app.ui.viewmodel.ContainerViewModel
 import com.droidspaces.app.util.ContainerManager
 import com.droidspaces.app.util.FilePickerUtils
-import androidx.compose.ui.Alignment
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.ui.Modifier
-import com.droidspaces.app.ui.util.LoadingIndicator
-import com.droidspaces.app.ui.util.LoadingSize
 import com.droidspaces.app.ui.util.FullScreenLoading
+import com.droidspaces.app.ui.util.LoadingSize
 import com.droidspaces.app.R
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.droidspaces.app.ui.viewmodel.AppStateViewModel
-import androidx.activity.ComponentActivity
 import android.net.Uri
 import androidx.navigation.NavType
 import androidx.navigation.navArgument
@@ -121,6 +116,9 @@ sealed class Screen(val route: String) {
     data object OpenRC : Screen("openrc/{containerName}") {
         fun createRoute(containerName: String) = "openrc/${Uri.encode(containerName)}"
     }
+    data object Runit : Screen("runit/{containerName}") {
+        fun createRoute(containerName: String) = "runit/${Uri.encode(containerName)}"
+    }
 
     data object Terminal : Screen("terminal/{containerName}") {
         fun createRoute(containerName: String) = "terminal/${Uri.encode(containerName)}"
@@ -157,19 +155,10 @@ fun DroidspacesNavigation(
     // MainTabScreen, which scrolls the pager to it and clears the request.
     var requestedTab by remember { mutableStateOf<TabItem?>(null) }
 
-    // Shared ViewModels scoped to Activity to ensure state consistency across screens
-    val activity = context as? ComponentActivity
-    val sharedContainerViewModel: ContainerViewModel = if (activity != null) {
-        viewModel(viewModelStoreOwner = activity)
-    } else {
-        viewModel()
-    }
-
-    val sharedAppStateViewModel: AppStateViewModel = if (activity != null) {
-        viewModel(viewModelStoreOwner = activity)
-    } else {
-        viewModel()
-    }
+    // Composed inside setContent, so the store owner is the activity and these outlive
+    // every screen.
+    val sharedContainerViewModel: ContainerViewModel = viewModel()
+    val sharedAppStateViewModel: AppStateViewModel = viewModel()
 
     // Determine initial destination immediately (synchronous read)
     val initialDestination = remember(prefsManager) {
@@ -219,7 +208,7 @@ fun DroidspacesNavigation(
         onShortcutHandled()
     }
 
-    // Define animation specs - consistent 200ms for snappy feel
+    // The NavHost default: a 200 ms fade both ways. Pop transitions follow these too.
     val defaultEnterTransition: AnimatedContentTransitionScope<NavBackStackEntry>.() -> EnterTransition = {
         fadeIn(animationSpec = AnimationUtils.fastSpec())
     }
@@ -248,7 +237,9 @@ fun DroidspacesNavigation(
 
     NavHost(
         navController = navController,
-        startDestination = initialDestination
+        startDestination = initialDestination,
+        enterTransition = defaultEnterTransition,
+        exitTransition = defaultExitTransition
     ) {
         composable(
             route = Screen.Welcome.route,
@@ -277,7 +268,6 @@ fun DroidspacesNavigation(
                     navController.navigate(Screen.Installation.route)
                 },
                 onSkip = {
-                    prefsManager.rootSkipped = true
                     prefsManager.isSetupCompleted = true
                     navController.navigate(Screen.Home.route) {
                         popUpTo(Screen.Welcome.route) { inclusive = true }
@@ -320,9 +310,7 @@ fun DroidspacesNavigation(
                 }
             ),
             enterTransition = homeEnterTransition,
-            exitTransition = defaultExitTransition,
             popEnterTransition = homeEnterTransition,
-            popExitTransition = defaultExitTransition
         ) { backStackEntry ->
             val fromInstallation = backStackEntry.arguments?.getBoolean("fromInstallation") ?: false
 
@@ -355,14 +343,7 @@ fun DroidspacesNavigation(
         }
 
         // Container installation wizard screens
-        composable(
-            route = Screen.ContainerName.route,
-            arguments = listOf(
-                navArgument("tarballUri") { type = NavType.StringType }
-            ),
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition
-        ) { backStackEntry ->
+        composable(Screen.ContainerName.route) { backStackEntry ->
             val viewModel: ContainerInstallationViewModel = viewModel(backStackEntry)
             val tarballUriString = backStackEntry.arguments?.getString("tarballUri") ?: ""
             val tarballUri = Uri.parse(tarballUriString)
@@ -395,22 +376,14 @@ fun DroidspacesNavigation(
             }
         }
 
-        composable(
-            route = Screen.RecommendedConfig.route,
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition
-        ) {
+        composable(Screen.RecommendedConfig.route) {
             RecommendedConfigScreen(
                 onNext = { navController.navigate(Screen.ContainerConfig.route) },
                 onBack = { navController.popBackStack() }
             )
         }
 
-        composable(
-            route = Screen.ContainerConfig.route,
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition
-        ) { backStackEntry ->
+        composable(Screen.ContainerConfig.route) { backStackEntry ->
             val viewModel = wizardScopedViewModel(navController, backStackEntry)
 
             ContainerConfigScreen(
@@ -427,11 +400,7 @@ fun DroidspacesNavigation(
             )
         }
 
-        composable(
-            route = Screen.SparseImageConfig.route,
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition
-        ) { backStackEntry ->
+        composable(Screen.SparseImageConfig.route) { backStackEntry ->
             val viewModel = wizardScopedViewModel(navController, backStackEntry)
 
             SparseImageConfigScreen(
@@ -448,11 +417,7 @@ fun DroidspacesNavigation(
             )
         }
 
-        composable(
-            route = Screen.InstallationSummary.route,
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition
-        ) { backStackEntry ->
+        composable(Screen.InstallationSummary.route) { backStackEntry ->
             val viewModel = wizardScopedViewModel(navController, backStackEntry)
             val config = viewModel.buildConfig()
             val tarballUri = viewModel.tarballUri
@@ -468,12 +433,7 @@ fun DroidspacesNavigation(
 
                 // Show loading while extracting filename
                 if (tarballName == null) {
-                    Box(
-                        modifier = Modifier.fillMaxSize(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        LoadingIndicator(size = com.droidspaces.app.ui.util.LoadingSize.Large)
-                    }
+                    FullScreenLoading()
                 } else {
                     InstallationSummaryScreen(
                         config = config,
@@ -494,11 +454,7 @@ fun DroidspacesNavigation(
             }
         }
 
-        composable(
-            route = Screen.InstallationProgress.route,
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition
-        ) { backStackEntry ->
+        composable(Screen.InstallationProgress.route) { backStackEntry ->
             val viewModel = wizardScopedViewModel(navController, backStackEntry)
             val config = viewModel.buildConfig()
             val tarballUri = viewModel.tarballUri
@@ -525,14 +481,7 @@ fun DroidspacesNavigation(
             }
         }
 
-        composable(
-            route = Screen.EditContainer.route,
-            arguments = listOf(
-                navArgument("containerName") { type = NavType.StringType }
-            ),
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition
-        ) { backStackEntry ->
+        composable(Screen.EditContainer.route) { backStackEntry ->
             val containerName = backStackEntry.arguments?.getString("containerName") ?: ""
             // Use shared ViewModel to ensure updates are reflected in other screens
             val containerViewModel: ContainerViewModel = sharedContainerViewModel
@@ -549,12 +498,7 @@ fun DroidspacesNavigation(
             }
 
             if (isLoading) {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
-                    LoadingIndicator(size = LoadingSize.Medium)
-                }
+                FullScreenLoading(size = LoadingSize.Medium)
             } else {
                 containerInfo?.let { container ->
                     EditContainerScreen(
@@ -570,13 +514,7 @@ fun DroidspacesNavigation(
             }
         }
 
-        composable(
-            route = Screen.Settings.route,
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition,
-            popEnterTransition = defaultEnterTransition,
-            popExitTransition = defaultExitTransition
-        ) {
+        composable(Screen.Settings.route) {
             SettingsScreen(
                 appStateViewModel = sharedAppStateViewModel,
                 onBack = {
@@ -598,13 +536,7 @@ fun DroidspacesNavigation(
             )
         }
 
-        composable(
-            route = Screen.TerminalAppearance.route,
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition,
-            popEnterTransition = defaultEnterTransition,
-            popExitTransition = defaultExitTransition
-        ) {
+        composable(Screen.TerminalAppearance.route) {
             TerminalAppearanceScreen(
                 onBack = {
                     navController.popBackStack()
@@ -612,13 +544,7 @@ fun DroidspacesNavigation(
             )
         }
 
-        composable(
-            route = Screen.AutoBootPriority.route,
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition,
-            popEnterTransition = defaultEnterTransition,
-            popExitTransition = defaultExitTransition
-        ) {
+        composable(Screen.AutoBootPriority.route) {
             AutoBootPriorityScreen(
                 containerViewModel = sharedContainerViewModel,
                 onBack = {
@@ -627,13 +553,7 @@ fun DroidspacesNavigation(
             )
         }
 
-        composable(
-            route = Screen.Requirements.route,
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition,
-            popEnterTransition = defaultEnterTransition,
-            popExitTransition = defaultExitTransition
-        ) {
+        composable(Screen.Requirements.route) {
             RequirementsScreen(
                 appStateViewModel = sharedAppStateViewModel,
                 onNavigateBack = {
@@ -642,14 +562,7 @@ fun DroidspacesNavigation(
             )
         }
 
-        composable(
-            route = Screen.ContainerDetails.route,
-            arguments = listOf(
-                navArgument("containerName") { type = NavType.StringType }
-            ),
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition
-        ) { backStackEntry ->
+        composable(Screen.ContainerDetails.route) { backStackEntry ->
             val containerName = backStackEntry.arguments?.getString("containerName") ?: ""
             // Use shared ViewModel to ensure we see updated details
             val containerViewModel: ContainerViewModel = sharedContainerViewModel
@@ -670,6 +583,8 @@ fun DroidspacesNavigation(
                                 navController.navigate(Screen.Procd.createRoute(containerName))
                             com.droidspaces.app.ui.screen.InitSystem.OPENRC ->
                                 navController.navigate(Screen.OpenRC.createRoute(containerName))
+                            com.droidspaces.app.ui.screen.InitSystem.RUNIT ->
+                                navController.navigate(Screen.Runit.createRoute(containerName))
                         }
                     },
                     onNavigateToTerminal = {
@@ -681,14 +596,7 @@ fun DroidspacesNavigation(
             }
         }
 
-        composable(
-            route = Screen.Systemd.route,
-            arguments = listOf(
-                navArgument("containerName") { type = NavType.StringType }
-            ),
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition
-        ) { backStackEntry ->
+        composable(Screen.Systemd.route) { backStackEntry ->
             val containerName = backStackEntry.arguments?.getString("containerName") ?: ""
             SystemdScreen(
                 containerName = containerName,
@@ -699,15 +607,7 @@ fun DroidspacesNavigation(
             )
         }
 
-        composable(
-            route = Screen.JournaldDump.route,
-            arguments = listOf(
-                navArgument("containerName") { type = NavType.StringType },
-                navArgument("unitName") { type = NavType.StringType }
-            ),
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition
-        ) { backStackEntry ->
+        composable(Screen.JournaldDump.route) { backStackEntry ->
             val containerName = backStackEntry.arguments?.getString("containerName") ?: ""
             val unitName = backStackEntry.arguments?.getString("unitName") ?: ""
             JournaldScreen(
@@ -717,15 +617,7 @@ fun DroidspacesNavigation(
             )
         }
 
-        composable(
-            route = Screen.UnitDetail.route,
-            arguments = listOf(
-                navArgument("containerName") { type = NavType.StringType },
-                navArgument("unitName") { type = NavType.StringType }
-            ),
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition
-        ) { backStackEntry ->
+        composable(Screen.UnitDetail.route) { backStackEntry ->
             val containerName = backStackEntry.arguments?.getString("containerName") ?: ""
             val unitName = backStackEntry.arguments?.getString("unitName") ?: ""
             UnitDetailScreen(
@@ -737,15 +629,7 @@ fun DroidspacesNavigation(
             )
         }
 
-        composable(
-            route = Screen.OverrideEditor.route,
-            arguments = listOf(
-                navArgument("containerName") { type = NavType.StringType },
-                navArgument("unitName") { type = NavType.StringType }
-            ),
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition
-        ) { backStackEntry ->
+        composable(Screen.OverrideEditor.route) { backStackEntry ->
             val containerName = backStackEntry.arguments?.getString("containerName") ?: ""
             val unitName = backStackEntry.arguments?.getString("unitName") ?: ""
             OverrideEditorScreen(
@@ -755,14 +639,7 @@ fun DroidspacesNavigation(
             )
         }
 
-        composable(
-            route = Screen.Procd.route,
-            arguments = listOf(
-                navArgument("containerName") { type = NavType.StringType }
-            ),
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition
-        ) { backStackEntry ->
+        composable(Screen.Procd.route) { backStackEntry ->
             val containerName = backStackEntry.arguments?.getString("containerName") ?: ""
             ProcdScreen(
                 containerName = containerName,
@@ -770,14 +647,7 @@ fun DroidspacesNavigation(
             )
         }
 
-        composable(
-            route = Screen.OpenRC.route,
-            arguments = listOf(
-                navArgument("containerName") { type = NavType.StringType }
-            ),
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition
-        ) { backStackEntry ->
+        composable(Screen.OpenRC.route) { backStackEntry ->
             val containerName = backStackEntry.arguments?.getString("containerName") ?: ""
             OpenRCScreen(
                 containerName = containerName,
@@ -785,16 +655,15 @@ fun DroidspacesNavigation(
             )
         }
 
-        composable(
-            route = Screen.Terminal.route,
-            arguments = listOf(
-                navArgument("containerName") { type = NavType.StringType }
-            ),
-            enterTransition = defaultEnterTransition,
-            exitTransition = defaultExitTransition,
-            popEnterTransition = defaultEnterTransition,
-            popExitTransition = defaultExitTransition
-        ) { backStackEntry ->
+        composable(Screen.Runit.route) { backStackEntry ->
+            val containerName = backStackEntry.arguments?.getString("containerName") ?: ""
+            RunitScreen(
+                containerName = containerName,
+                onNavigateBack = { navController.popBackStack() }
+            )
+        }
+
+        composable(Screen.Terminal.route) { backStackEntry ->
             val containerName = backStackEntry.arguments?.getString("containerName") ?: ""
             ContainerTerminalScreen(
                 containerName = containerName,

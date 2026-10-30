@@ -110,25 +110,31 @@ sufficient.
 make native            # build for the host architecture
 make aarch64           # cross builds: aarch64, x86_64, armhf, x86, riscv64
 make debug-hardened    # ASan, UBSan, LSan build for chasing memory bugs
-make all-build         # every architecture, then syncs into the APK assets
+make all-build         # every architecture
 make all-tarball       # all-build plus a release tarball
+make bump NEW=x.y.z    # set DS_VERSION in droidspace.h
 make format            # clang-format over src/, using the repo .clang-format
 make clean
 ```
 
 Bare `make` prints help and builds nothing. `make native` needs a musl toolchain; if it is
-missing, run `./install-musl.sh <arch>` as the error message tells you.
+missing, run `scripts/install-musl.sh <arch>` as the error message tells you.
 
-Useful options: `V=1` for full compiler command lines, `ENABLE_SOCKETD_BACKEND=0` for a
-minimal build without the private API bridge.
+The build is incremental: a header edit rebuilds only the objects that include it, and an
+unchanged arch is a no-op, so `make aarch64` after `make native` costs a full build once and
+nothing afterwards. Objects live under `output/.obj/<arch>`. A compiler or `CFLAGS` change is
+not tracked, so `make clean` after those.
+
+Useful options: `V=1` for full compiler command lines, `NO_STRIP=1` to keep symbols,
+`MUSL_CROSS=dir` to point at a directory of `<triplet>-gcc`.
 
 The build runs with `-Wall -Wextra -Wpedantic -Werror` plus format, shadow, and truncation
 warnings. A warning is a build failure, not a review comment.
 
 Adding a new `.c` file means adding it to `SRCS` in the Makefile. There is no wildcard.
 
-The version string is scraped from `DS_VERSION` in `src/include/droidspace.h`. Bump it
-there, not in the Makefile.
+The version string is scraped from `DS_VERSION` in `src/include/droidspace.h`. `make bump
+NEW=x.y.z` rewrites it; nothing else carries the version.
 
 ### Android app
 
@@ -139,14 +145,19 @@ From `Android/`:
 ./build.sh release     # signed release APK
 ```
 
-Use the script rather than calling gradle directly. It sets up the wrapper, cleans, and
-places the APK where the rest of the tooling expects it.
+Use the script rather than calling gradle directly. The APK build runs `make` for the four
+phone arches and packages `output/droidspaces-<arch>` as a generated asset, so it needs the
+musl toolchains and never reads a binary you copied by hand.
 
 ### CI
 
 `.github/workflows/ci.yml` runs `make all-tarball`, `scripts/mkdeb.sh`, and the gradle
-release build. It does **not** check formatting, so running `make format` is your
-responsibility.
+release build on every push and pull request. It does **not** check formatting, so running
+`make format` is your responsibility.
+
+A release is a tag: `make bump NEW=x.y.z`, commit, then push the tag `vx.y.z`. CI refuses a
+tag that does not match `DS_VERSION`, and publishes the APK, tarball, Debian packages and a
+`SHA256SUMS` file with a changelog of every commit since the previous tag.
 
 ## Code Style
 
@@ -230,7 +241,7 @@ change in the wrong place is a second bug.
 | `refactor:` | backend restructuring with no behavior change |
 | `feat:` | new backend features |
 | `docs:` | documentation |
-| `net:` `mount:` `seccomp:` `daemon:` `socketd:` | scoped backend subsystem changes |
+| `net:` `mount:` `seccomp:` `daemon:` | scoped backend subsystem changes |
 | `fix(security):` | anything security related, either half |
 
 ## Reuse Inventory
@@ -291,7 +302,7 @@ the language and about dialogs in `ui/screen/SettingsScreen.kt`). Do not import 
 | `PrimaryActionBottomBar(label, icon, onClick, ...)` | `ui/component/PrimaryActionBottomBar.kt` | Any wizard or full screen "Next", "Install", "Continue" bar. Seven screens use it. The overload taking a `content` slot is for buttons that swap their contents |
 | `SaveActionBottomBar(isSaved, isSaving, canSave, onSave, ...)` | `ui/component/SaveActionBottomBar.kt` | A save bar with the save, saving and saved states |
 | `PullToRefreshWrapper(onRefresh) { ... }` | `ui/component/PullToRefreshWrapper.kt` | Any pull to refresh list or tab body |
-| `showSuccess/showError/showInfo(snackbarHostState, message)` | `ui/util/SnackbarUtils.kt` | All snackbars. Never call `showSnackbar` directly |
+| `showSuccess/showError(snackbarHostState, message)` | `ui/util/SnackbarUtils.kt` | All snackbars. Never call `showSnackbar` directly |
 | `FloatingActionButtonMenu` + `ToggleFloatingActionButton` | `ui/screen/ContainersScreen.kt` | A screen with more than one floating action. Copy that block, never stack FABs. See DESIGN.md "Floating action button" |
 
 ### Android: cards and list items
@@ -301,10 +312,12 @@ the language and about dialogs in `ui/screen/SettingsScreen.kt`). Do not import 
 | `SettingsGroup { }` + `GroupHeader`, `GroupIntro`, `GroupDivider` | `ui/component/SettingsGroup.kt` | Any settings-style screen: one surface per section, rows flat inside, a header above |
 | `NavRow(title, onClick, icon, value, summary, danger, error)` | `ui/component/SettingsGroup.kt` | A row in a group that opens a page, showing the current value |
 | `RadioRow(title, description, selected, onClick)` | `ui/component/NetworkModePage.kt` | One option of a radio list in a group |
+| `DsRadioRow(label, selected, onClick, fontFamily, delete)` | `ui/component/DsRadioRow.kt` | One option of a single-select list in a dialog: the font and user pickers |
+| `DsSearchBar(query, onQueryChange, placeholder, ...)` | `ui/component/DsSearchBar.kt` | The search field above a filterable list |
 | `EntryRow(text, onDelete, ...)` / `AddEntryButton(label, onClick)` | `ui/component/ListEntryCards.kt` | Editable lists: the entries inside a group, the add button under it |
 | `GroupField { }` / `InlineWarning(text)` | `ui/component/ContainerConfigForm.kt` | A text field inside a group, padded like the rows; an error-tinted note inside one |
 | `screenGutter()`, `isCompactWidth()`, `isShortHeight()` | `ui/component/SettingsGroup.kt` | Margins and layout switches for narrow and short windows. See DESIGN.md "Small screens" |
-| `SettingsCard(title, onClick, icon, subtitleContent, trailing, below, ...)` | `ui/component/SettingsCard.kt` | A standalone card row outside a group |
+| `SettingsCard(title, onClick, icon, subtitleContent, trailing, ...)` | `ui/component/SettingsCard.kt` | A standalone card row outside a group |
 | `ToggleCard` | `ui/component/ToggleCard.kt` | A standalone switch card. Inside a group use `SwitchItem` |
 | `DsSlider(value, onValueChange, valueRange, ...)` | `ui/component/DsSlider.kt` | Any slider. Never restyle a raw `Slider` at the call site |
 | `SwitchItem` | `ui/component/SwitchItem.kt` | The switch row inside a `SettingsGroup`. See the duplicates note below |
@@ -326,7 +339,6 @@ the language and about dialogs in `ui/screen/SettingsScreen.kt`). Do not import 
 | `LoadingIndicator`, `ContainedLoadingIndicator`, `MaterialShapes` | `androidx.compose.material3` | The Expressive indicators and shapes come from the library; `ui/util/LoadingIndicator.kt` only wraps the sizes |
 | `TerminalConsole(logs, isProcessing, maxHeight)` | `ui/component/TerminalConsole.kt` | Inline scrolling log view |
 | `ShimmerAnimation(enabled) { ... }` | `ui/component/TerminalConsole.kt` | Skeleton loading effect |
-| `PercentCircle(percent, size, strokeWidth, ...)` | `ui/component/PercentCircle.kt` | Circular percentage gauge. Currently unused, reuse it before writing another |
 
 ### Android: theme
 
@@ -375,7 +387,7 @@ it should be set.
 
 | Symbol | Path | Use it when |
 | --- | --- | --- |
-| `ServiceManagerBase.isSafeServiceName(name)` | `util/ServiceManagerBase.kt` | Any service or unit name that came from inside a container, before it reaches a shell. Fails closed |
+| `ContainerInitManager.isSafeServiceName(name)` | `util/ContainerInitManager.kt` | Any service or unit name that came from inside a container, before it reaches a shell. Fails closed |
 | `ValidationUtils.validateContainerName` / `isSafeContainerName` / `normalizeContainerName` | `util/ValidationUtils.kt` | Container names. Normalize first, then validate. Both fail closed |
 | `ValidationUtils.validateHostname` / `sanitizeHostname` | same | Hostnames |
 | `ValidationUtils.validateConfigValues(config)` | same | Before writing a config. Rejects control characters in single-line values |
@@ -417,16 +429,16 @@ boundary.
 
 ### Android: init system managers and container introspection
 
-All three init managers share the same shape. The container name is always quoted through
+All four init managers share the same shape. The container name is always quoted through
 `ContainerCommandBuilder`, and the service name is always allow-listed through
-`ServiceManagerBase`.
+`ContainerInitManager.isSafeServiceName`.
 
 | Symbol | Path | Use it when |
 | --- | --- | --- |
 | `ContainerSystemdManager` | `util/ContainerSystemdManager.kt` | systemd units. Also owns unit inspection and drop-in override read, write, delete. The base64 streaming in `setOverrideConf` is the pattern to copy for arbitrary text |
 | `ContainerOpenRCManager` | `util/ContainerOpenRCManager.kt` | OpenRC services |
 | `ContainerProcdManager` | `util/ContainerProcdManager.kt` | procd services. The only manager that also allow-lists the action |
-| `ContainerProcessManager` | `util/ContainerProcessManager.kt` | Process list and kill inside a container |
+| `ContainerRunitManager` | `util/ContainerRunitManager.kt` | runit services |
 | `ContainerUsersManager` | `util/ContainerUsersManager.kt` | Container user list, cached |
 | `ContainerOSInfoManager` | `util/ContainerOSInfoManager.kt` | Distro name, version, icon, and live usage. `OSInfo.ramLabel(context)` is the one formatter for the RAM text, limit aware |
 | `ContainerUsageCollector` | `util/ContainerUsageCollector.kt` | CPU, RAM, uptime, IP in one call |
@@ -446,7 +458,7 @@ validation. Prefer the wrappers.
 | `ContainerUsageViewModel` | `ui/viewmodel/ContainerUsageViewModel.kt` | Live usage polling |
 | `SystemStatsViewModel` | `ui/viewmodel/SystemStatsViewModel.kt` | Per-container OS info |
 | `RootfsRepoViewModel` | `ui/viewmodel/RootfsRepoViewModel.kt` | Repo listing and per-asset download state |
-| `InitServiceViewModel` | `ui/viewmodel/InitServiceViewModel.kt` | Init-system service list, filter and search, shared by systemd, OpenRC and procd |
+| `InitServiceViewModel` | `ui/viewmodel/InitServiceViewModel.kt` | Init-system service list, filter and search, shared by systemd, OpenRC, procd and runit |
 
 ### Android: terminal
 
@@ -465,8 +477,8 @@ validation. Prefer the wrappers.
 | `RootfsDownloadManager` | `util/RootfsDownloadManager.kt` | Enqueueing, polling, and cancelling a rootfs download, plus battery exemption |
 | `ContainerInstaller.installContainer(...)` | `util/ContainerInstaller.kt` | Installing from a tarball. Validates, checks storage, extracts, writes config, cleans up on failure |
 | `SparseImageInstaller.extract(...)` | `util/SparseImageInstaller.kt` | The sparse image truncate, format, mount, extract, unmount lifecycle |
-| `BinaryInstaller` / `InstallationStep` | `util/BinaryInstaller.kt` | Installing the backend binary and signalling the daemon |
-| `ModuleInstaller` / `ModuleInstallationStep` | `util/ModuleInstaller.kt` | Installing the Magisk module |
+| `BinaryInstaller` | `util/BinaryInstaller.kt` | Installing the backend binary and signalling the daemon |
+| `ModuleInstaller` | `util/ModuleInstaller.kt` | Installing the Magisk module |
 | `SymlinkInstaller` | `util/SymlinkInstaller.kt` | Enabling and disabling the binary symlink |
 | `FilePickerUtils`, `IconUtils` | `util/` | File name resolution, distro icon lookup. `FilePickerUtils.realPath(context, uri)` turns a picked document into a path root can read or write in place, null for pipe-backed providers |
 
@@ -510,7 +522,7 @@ a verbosity flag.
 | `write_file_atomic(path, content)` | Anything persistent. `mkstemp` plus `fsync` plus `rename`, so a pre-planted symlink at a predictable temp name cannot win |
 | `write_file`, `read_file`, `write_all` | One-shot write, read to buffer, EINTR-safe full write. Never loop on bare `write()` |
 | `grep_file(path, pattern)` | Substring test over a file |
-| `mkdir_p`, `remove_recursive`, `copy_file` | The `mkdir -p`, `rm -rf`, and stream copy equivalents |
+| `mkdir_p`, `remove_recursive` | The `mkdir -p` and `rm -rf` equivalents |
 | `is_subpath(parent, child)` | Path escape validation. Realpath based, use this instead of `strncmp` |
 | `is_ramfs`, `is_mountpoint` | Filesystem type and mountpoint tests |
 | `build_proc_root_path(pid, suffix, buf, size)` | Building `/proc/<pid>/root/...` with truncation checked |
@@ -545,10 +557,9 @@ influenced, copy the `ds_bind_mount_socket` pattern: open with `O_NOFOLLOW|O_CLO
 | Symbol | Use it when |
 | --- | --- |
 | `is_android()` | The mandatory gate for every Android-only or Linux-only path, both directions |
-| `is_running_in_termux()` | Termux environment |
 | `get_kernel_version`, `check_kernel_recommendation` | Version gating against `DS_MIN_KERNEL_MAJOR` and `DS_MIN_KERNEL_MINOR` |
 | `check_ns(flag, name)` | Probing whether a `CLONE_NEW*` namespace is usable. The network namespace is answered from `/proc/self/ns/net` alone: creating one to test it stalls the real `unshare` behind its teardown on kernels before 4.17 |
-| `ds_cgroup_v2_usable`, `ds_cgroup_kernel_supports_v2`, `ds_cgroup_host_is_v2` | cgroup generation gates |
+| `ds_cgroup_host_is_v2` | cgroup generation gate |
 | `ds_nl_probe_nat_capability(reason, size)` | Kernel bridge, veth, and NAT capability. Fork free. Run before any NAT setup. A full pass is remembered for the boot in `Net/nat_caps`, keyed by boot_id; anything less is probed again |
 | `ds_get_selinux_status()`, `is_systemd_rootfs(path)` | SELinux mode, and rootfs flavour |
 
@@ -561,7 +572,6 @@ whole tree. It is almost entirely fixed-size, with three heap-owned lists.
 | --- | --- |
 | `ds_config_load` / `ds_config_load_by_name` | Loading a config. Prefer the by-name form over building the path yourself |
 | `ds_config_save` / `ds_config_save_by_name` | Saving |
-| `ds_config_validate` | Before acting on a loaded config |
 | `ds_config_add_bind(cfg, src, dest, ro)` | The only way to add a bind mount. Grows, de-dups, validates |
 | `ds_config_free` | Teardown. It calls the three per-list free functions |
 | `sort_bind_mounts(cfg)` | Before applying binds, so parents mount before children |
@@ -577,9 +587,9 @@ an unknown line.
 
 | Symbol | Use it when |
 | --- | --- |
-| `domount`, `domount_silent`, `bind_mount` | Mounting. Use these instead of raw `mount(2)` |
+| `domount`, `bind_mount` | Mounting. Use these instead of raw `mount(2)` |
 | `ds_apply_jail_mask(hw_access, privileged_mask)` | Masking `/proc` and `/sys` entries |
-| `setup_dev`, `create_devices`, `setup_devpts`, `ds_fix_host_ptys` | Device node setup |
+| `setup_dev`, `create_devices`, `setup_devpts` | Device node setup |
 | `setup_custom_binds(cfg, rootfs)` | Applying `cfg->binds` |
 | `setup_volatile_overlay`, `cleanup_volatile_overlay`, `check_volatile_mode` | Volatile mode |
 | `mount_rootfs_img`, `unmount_rootfs_img` | Sparse image loop device lifecycle |
@@ -588,12 +598,11 @@ an unknown line.
 | `ds_cgroup_ctrl_dir(ctrl, name, dir, size)` | Finding where a container's files for one controller live: its cgroup v2 dir, or the v1 hierarchy that owns the controller, wherever it is mounted. Returns the version. Never hardcode `/sys/fs/cgroup/...` or `/dev/memcg` for a controller file |
 | `ds_cgroup_apply_limits`, `ds_cgroup_get_limits`, `ds_cgroup_get_usage`, `print_cgroup_status` | Setting limits, reading back the ones in force, and usage. Report limits from `ds_cgroup_get_limits`, not from the config, which only says what was asked for |
 | `ds_cgroup_v1_setup`, `ds_cgroup_v1_join` | Giving a v1 container its own cgroup in every v1 hierarchy before the namespace is unshared, and moving the monitor in or out of them |
-| `ds_cg_word_in_list(list, name)` | Testing for a controller name. Do not `strstr` a controller list |
 | `get_workspace_dir`, `get_pids_dir`, `get_net_dir`, `get_logs_dir` | The only sanctioned way to build a workspace path. They switch between the Android and Linux roots |
 | `ensure_workspace` | Creating the tree |
 | `is_container_running`, `find_container_by_name`, `find_container_init_pid`, `is_container_init` | Container lookup |
 | `ds_feature_needs(offsetof(struct ds_config, field))` | The generic feature scanner. A new global daemon adds a two-line wrapper here, not a new scanner |
-| `ds_seccomp_apply_minimal`, `android_seccomp_setup` | The seccomp filters |
+| `ds_seccomp_apply_minimal`, `ds_seccomp_keyring_shim` | The seccomp filters |
 | `ds_ksu_neutralize_root_escape` | KernelSU hardening. Must run **before** `ds_seccomp_apply_minimal`, whose magic-reboot block would otherwise deny the reboot it needs |
 | `ds_apply_capability_hardening` | Capability dropping |
 
@@ -631,7 +640,7 @@ shell-out on the fast path. The netfilter helpers take an address family (`AF_IN
 
 | Symbol | Contract |
 | --- | --- |
-| `ds_peer_authorized(fd, group_name)` | The only authorization gate in the tree. Allows root or a member of the group, but only when the peer shares our PID namespace. Every failure path denies. Callers are `src/daemon.c` and `src/socketd_bridge.c` |
+| `ds_peer_authorized(fd, group_name)` | The only authorization gate in the tree. Allows root or a member of the group, but only when the peer shares our PID namespace. Every failure path denies. The caller is `src/daemon.c` |
 | `ds_peer_in_pidns(peer_pid)` | Must fail closed. A pid of zero is not translatable into our namespace, and a failed readlink means we cannot prove membership. Both deny. Failing open here let a caller recycle a dead pid and escape to host root |
 | `ds_bind_mount_socket(src, dst, uid, label)` | The symlink-race-safe write pattern for anything landing in a container-controlled directory |
 | `set_selinux_context`, `get_selinux_context`, `ds_selinux_dyntransition`, `ds_selinux_enter_domain`, `ds_drop_privileges`, `ds_resolve_termux_uid` | SELinux and privilege handling |

@@ -9,22 +9,14 @@
 
 /* Console Monitor Loop */
 
-/* Read the current container init PID from the pidfile.
- * After an in-container reboot, the intermediate process updates the pidfile
- * with the new init PID, so this always returns the LIVE container PID. */
-static pid_t read_current_container_pid(const char *pidfile) {
-  if (!pidfile || !pidfile[0])
-    return -1;
-
-  pid_t pid = -1;
-  if (read_and_validate_pid(pidfile, &pid) == 0)
-    return pid;
-  return -1;
-}
-
-int console_monitor_loop(int master_fd, pid_t monitor_pid,
+/* The console pair arrives on console_sock from container init, once per boot
+ * cycle: init sends it before it execs and wait_for_boot() returns at that
+ * exec, so the first pair is already queued when we get here. An in-container
+ * reboot brings a fresh pair, and the old one is swapped out for it. */
+int console_monitor_loop(int console_sock, pid_t monitor_pid,
                          struct ds_config *cfg) {
   int epfd, sfd;
+  int master_fd = -1, slave_fd = -1;
   sigset_t mask;
   struct signalfd_siginfo fdsi;
   struct epoll_event ev, events[10];
@@ -58,11 +50,11 @@ int console_monitor_loop(int master_fd, pid_t monitor_pid,
   if (epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &ev) < 0)
     ds_warn("epoll_ctl(stdin) failed: %s", strerror(errno));
 
-  /* 2. Watch PTY master */
-  ev.events = EPOLLIN | EPOLLHUP | EPOLLERR;
-  ev.data.fd = master_fd;
-  if (epoll_ctl(epfd, EPOLL_CTL_ADD, master_fd, &ev) < 0)
-    ds_warn("epoll_ctl(master_fd) failed: %s", strerror(errno));
+  /* 2. Watch for the console pair; the master joins once it arrives */
+  ev.events = EPOLLIN;
+  ev.data.fd = console_sock;
+  if (epoll_ctl(epfd, EPOLL_CTL_ADD, console_sock, &ev) < 0)
+    ds_warn("epoll_ctl(console_sock) failed: %s", strerror(errno));
 
   /* 3. Watch signalfd */
   ev.events = EPOLLIN;
@@ -73,13 +65,6 @@ int console_monitor_loop(int master_fd, pid_t monitor_pid,
   /* Set terminal to raw mode */
   struct termios oldtios;
   int is_tty = ds_setup_tios(STDIN_FILENO, &oldtios);
-
-  /* Initial window size sync */
-  if (is_tty == 0) {
-    struct winsize ws;
-    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
-      ioctl(master_fd, TIOCSWINSZ, &ws);
-  }
 
   int running = 1;
   while (running) {
@@ -125,12 +110,12 @@ int console_monitor_loop(int master_fd, pid_t monitor_pid,
             continue; /* Don't write the CTRL+ALT+Q sequence to the PTY */
           }
 
+          if (master_fd < 0)
+            continue; /* typed before the console arrived */
           if (write_all(master_fd, buf, (size_t)n) < 0) {
             running = 0;
             break;
           }
-        } else if (n == 0) {
-          /* EOF on stdin */
         }
       } else if (fd == master_fd) {
         /* Container output -> User stdout */
@@ -144,6 +129,37 @@ int console_monitor_loop(int master_fd, pid_t monitor_pid,
         } else {
           running = 0;
         }
+      } else if (fd == console_sock) {
+        int m, s;
+        if (ds_console_recv(console_sock, &m, &s) < 0) {
+          /* End of file: the monitor is gone and its SIGCHLD is on its way.
+           * Level-triggered, the socket would wake us until then. */
+          epoll_ctl(epfd, EPOLL_CTL_DEL, console_sock, NULL);
+          continue;
+        }
+        if (master_fd >= 0) {
+          /* epoll keys on the open file, which the sender's copy may still
+           * keep alive, so close() alone would leave the old master in the
+           * set under a number the new one may reuse. Its last lines are
+           * still worth showing. */
+          epoll_ctl(epfd, EPOLL_CTL_DEL, master_fd, NULL);
+          int fl = fcntl(master_fd, F_GETFL, 0);
+          if (fl >= 0)
+            (void)fcntl(master_fd, F_SETFL, fl | O_NONBLOCK);
+          while ((n = read(master_fd, buf, sizeof(buf))) > 0)
+            write_all(STDOUT_FILENO, buf, (size_t)n);
+          close(master_fd);
+          close(slave_fd);
+        }
+        master_fd = m;
+        slave_fd = s;
+        ev.events = EPOLLIN | EPOLLHUP | EPOLLERR;
+        ev.data.fd = master_fd;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, master_fd, &ev) < 0)
+          ds_warn("epoll_ctl(master_fd) failed: %s", strerror(errno));
+        struct winsize ws;
+        if (is_tty == 0 && ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
+          ioctl(master_fd, TIOCSWINSZ, &ws);
       } else if (fd == sfd) {
         /* Signal handling */
         n = read(sfd, &fdsi, sizeof(fdsi));
@@ -159,12 +175,15 @@ int console_monitor_loop(int master_fd, pid_t monitor_pid,
           }
         } else if (fdsi.ssi_signo == SIGWINCH) {
           struct winsize ws;
-          if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
+          if (master_fd >= 0 && ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
             ioctl(master_fd, TIOCSWINSZ, &ws);
         } else if (fdsi.ssi_signo == SIGINT || fdsi.ssi_signo == SIGTERM) {
           /* Forward to container init (read live PID) */
-          pid_t live_pid = read_current_container_pid(cfg->pidfile);
-          if (live_pid > 0)
+          /* The pidfile follows an in-container reboot, so it names the
+           * live init. */
+          pid_t live_pid = -1;
+          if (read_and_validate_pid(cfg->pidfile, &live_pid) == 0 &&
+              live_pid > 0)
             kill(live_pid, (int)fdsi.ssi_signo);
         }
       }
@@ -176,6 +195,10 @@ int console_monitor_loop(int master_fd, pid_t monitor_pid,
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &oldtios);
   }
 
+  if (master_fd >= 0) {
+    close(master_fd);
+    close(slave_fd);
+  }
   close(epfd);
   close(sfd);
   return ret;

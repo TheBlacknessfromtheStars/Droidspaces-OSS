@@ -157,6 +157,10 @@ data class ContainerInfo(
     }
 }
 
+/** What a failed root command said, or its exit code when it said nothing. */
+fun Shell.Result.errorText(): String =
+    (out + err).joinToString("\n").trim().ifEmpty { "Unknown error (exit code: $code)" }
+
 object ContainerManager {
     private const val CONTAINERS_BASE_PATH = Constants.CONTAINERS_BASE_PATH
 
@@ -222,57 +226,22 @@ object ContainerManager {
      * Returns a list of ContainerInfo objects.
      */
     suspend fun listContainers(): List<ContainerInfo> = withContext(Dispatchers.IO) {
-        val containers = mutableListOf<ContainerInfo>()
-
-        try {
-            // List all directories in the containers base path (quoted for safety)
-            val listResult = Shell.cmd("ls -d \"$CONTAINERS_BASE_PATH\"/*/ 2>/dev/null").exec()
-
-            if (!listResult.isSuccess) {
-                // Directory might not exist or be empty
-                return@withContext emptyList()
-            }
-
-            // Parse each directory path
-            listResult.out.forEach { line ->
-                val trimmed = line.trim()
-                if (trimmed.isEmpty() || !trimmed.startsWith(CONTAINERS_BASE_PATH)) {
-                    return@forEach
-                }
-
-                // Extract sanitized container name from path: /data/local/Droidspaces/Containers/name/
-                val sanitizedName = trimmed
-                    .removeSuffix("/")
-                    .substringAfterLast("/")
-
-                if (sanitizedName.isEmpty()) {
-                    return@forEach
-                }
-
-                // Try to load container config
-                val configPath = "$CONTAINERS_BASE_PATH/$sanitizedName/${Constants.CONTAINER_CONFIG_FILE}"
-                // Use sanitizedName as default, but config file will have the real name
-                val config = loadContainerConfig(configPath, sanitizedName)
-
-                if (config != null) {
-                    // Check if container is running (use the real name from config)
-                    val runningInfo = checkContainerStatus(config.name)
-                    val status = if (runningInfo.first) {
-                        ContainerStatus.RUNNING
-                    } else {
-                        ContainerStatus.STOPPED
-                    }
-                    containers.add(config.copy(
-                        status = status,
-                        pid = runningInfo.second
-                    ))
-                }
-            }
-        } catch (e: Exception) {
-            // Return empty list on error
+        // ls fails on a missing or empty directory, which is the "no containers" answer.
+        val listResult = Shell.cmd("ls -d \"$CONTAINERS_BASE_PATH\"/*/ 2>/dev/null").exec()
+        if (!listResult.isSuccess) return@withContext emptyList()
+        listResult.out.mapNotNull { line ->
+            // /data/local/Droidspaces/Containers/<sanitized name>/
+            val trimmed = line.trim()
+            if (!trimmed.startsWith(CONTAINERS_BASE_PATH)) return@mapNotNull null
+            val sanitizedName = trimmed.removeSuffix("/").substringAfterLast("/")
+            if (sanitizedName.isEmpty()) null else getContainerInfo(sanitizedName)
         }
+    }
 
-        containers
+    /** Every non-blank line of a command's output to the logger, stdout as info, stderr as error. */
+    private suspend fun logResult(result: Shell.Result, logger: ViewModelLogger) {
+        result.out.forEach { line -> line.trim().takeIf { it.isNotEmpty() }?.let { logger.i(it) } }
+        result.err.forEach { line -> line.trim().takeIf { it.isNotEmpty() }?.let { logger.e(it) } }
     }
 
     /**
@@ -288,7 +257,7 @@ object ContainerManager {
      * The parent is removed with a plain rmdir, which fails harmlessly when it still holds
      * anything, so a shared destination folder never takes other containers down with it.
      */
-    private suspend fun deleteExternalRootfs(rootfsPath: String, logger: ContainerLogger) {
+    private suspend fun deleteExternalRootfs(rootfsPath: String, logger: ViewModelLogger) {
         val name = rootfsPath.substringAfterLast('/')
         if (name != "rootfs" && name != "rootfs.img") {
             logger.w("Rootfs at $rootfsPath is not named rootfs or rootfs.img, so it was not")
@@ -297,11 +266,8 @@ object ContainerManager {
             return
         }
 
-        val quoted = ContainerCommandBuilder.quote(rootfsPath)
-        val result = Shell.cmd("rm -rf $quoted 2>&1").exec()
-        (result.out + result.err).forEach { line ->
-            line.trim().takeIf { it.isNotEmpty() }?.let { logger.i(it) }
-        }
+        val result = Shell.cmd("rm -rf ${ContainerCommandBuilder.quote(rootfsPath)} 2>&1").exec()
+        logResult(result, logger)
         if (!result.isSuccess) {
             // The volume may simply be unplugged. Say so and carry on: refusing to
             // uninstall would leave the container listed with no way to remove it.
@@ -335,19 +301,9 @@ object ContainerManager {
      * Load container configuration from config file.
      */
     private fun loadContainerConfig(configPath: String, defaultName: String): ContainerInfo? {
-        try {
-            // Read config file using shell (quoted for safety)
-            val readResult = Shell.cmd("cat ${ContainerCommandBuilder.quote(configPath)} 2>/dev/null").exec()
-
-            if (!readResult.isSuccess || readResult.out.isEmpty()) {
-                return null
-            }
-
-            val configContent = readResult.out.joinToString("\n")
-            return parseConfig(configContent, defaultName)
-        } catch (e: Exception) {
-            return null
-        }
+        val readResult = Shell.cmd("cat ${ContainerCommandBuilder.quote(configPath)} 2>/dev/null").exec()
+        if (!readResult.isSuccess || readResult.out.isEmpty()) return null
+        return parseConfig(readResult.out.joinToString("\n"), defaultName)
     }
 
     /**
@@ -489,25 +445,10 @@ object ContainerManager {
      *  - NEVER calls cleanup_container_resources (safe to call post-start)
      */
     suspend fun checkContainerStatus(containerName: String): Pair<Boolean, Int?> = withContext(Dispatchers.IO) {
-        try {
-            val binary = Constants.DROIDSPACES_BINARY_PATH
-            val quotedName = ContainerCommandBuilder.quote(containerName)
-            val result = Shell.cmd("\"$binary\" --name=$quotedName pid 2>/dev/null").exec()
-
-            val output = result.out.firstOrNull()?.trim() ?: "NONE"
-            if (output == "NONE" || output.isEmpty()) {
-                return@withContext Pair(false, null)
-            }
-
-            val pid = output.toIntOrNull()
-            if (pid != null && pid > 0) {
-                return@withContext Pair(true, pid)
-            }
-        } catch (e: Exception) {
-            // Ignore errors - treat as stopped
-        }
-
-        Pair(false, null)
+        val result = Shell.cmd("\"${Constants.DROIDSPACES_BINARY_PATH}\" --name=${ContainerCommandBuilder.quote(containerName)} pid 2>/dev/null").exec()
+        // "NONE", or no output at all, is the stopped answer.
+        val pid = result.out.firstOrNull()?.trim()?.toIntOrNull()
+        if (pid != null && pid > 0) Pair(true, pid) else Pair(false, null)
     }
 
     /**
@@ -517,22 +458,10 @@ object ContainerManager {
     suspend fun getContainerInfo(name: String): ContainerInfo? = withContext(Dispatchers.IO) {
         val sanitizedName = sanitizeContainerName(name)
         val configPath = "$CONTAINERS_BASE_PATH/$sanitizedName/${Constants.CONTAINER_CONFIG_FILE}"
-        val config = loadContainerConfig(configPath, sanitizedName)
-
-        if (config != null) {
-            val runningInfo = checkContainerStatus(name)
-            val status = if (runningInfo.first) {
-                ContainerStatus.RUNNING
-            } else {
-                ContainerStatus.STOPPED
-            }
-            config.copy(
-                status = status,
-                pid = runningInfo.second
-            )
-        } else {
-            null
-        }
+        val config = loadContainerConfig(configPath, sanitizedName) ?: return@withContext null
+        // The pidfile is keyed by the real name from the config, not the directory's
+        val (running, pid) = checkContainerStatus(config.name)
+        config.copy(status = if (running) ContainerStatus.RUNNING else ContainerStatus.STOPPED, pid = pid)
     }
 
     /**
@@ -544,16 +473,12 @@ object ContainerManager {
      * table, so `ip route show default` returns empty.
      */
     suspend fun listUpstreamInterfaces(): List<String> = withContext(Dispatchers.IO) {
-        try {
-            val busybox = Constants.BUSYBOX_BINARY_PATH
-            val cmd = "ip route show table all | $busybox grep '^default' | $busybox awk '{for(i=1;i<=NF;i++) if(\$i==\"dev\") print \$(i+1)}' | $busybox grep -Ev '^(ds-|dummy)' | $busybox sort -u"
-            val result = Shell.cmd(cmd).exec()
-            if (result.isSuccess) {
-                result.out.map { it.trim() }.filter { it.isNotEmpty() }
-            } else {
-                emptyList()
-            }
-        } catch (e: Exception) {
+        val busybox = Constants.BUSYBOX_BINARY_PATH
+        val cmd = "ip route show table all | $busybox grep '^default' | $busybox awk '{for(i=1;i<=NF;i++) if(\$i==\"dev\") print \$(i+1)}' | $busybox grep -Ev '^(ds-|dummy)' | $busybox sort -u"
+        val result = Shell.cmd(cmd).exec()
+        if (result.isSuccess) {
+            result.out.map { it.trim() }.filter { it.isNotEmpty() }
+        } else {
             emptyList()
         }
     }
@@ -564,16 +489,12 @@ object ContainerManager {
      * point carries a second MAC is for the user to find out.
      */
     suspend fun listEthernetInterfaces(): List<String> = withContext(Dispatchers.IO) {
-        try {
-            // One grep over every type file: a cat per interface cost about a second
-            // on a phone with 45 of them, most of them rmnet.
-            val busybox = Constants.BUSYBOX_BINARY_PATH
-            val result = Shell.cmd("$busybox grep -l '^1$' /sys/class/net/*/type; true").exec()
-            result.out.mapNotNull { it.trim().removePrefix("/sys/class/net/").removeSuffix("/type").takeIf(String::isNotEmpty) }
-                .filterNot { n -> ETHERNET_SKIP.any { n.startsWith(it) } }
-        } catch (e: Exception) {
-            emptyList()
-        }
+        // One grep over every type file: a cat per interface cost about a second
+        // on a phone with 45 of them, most of them rmnet.
+        val busybox = Constants.BUSYBOX_BINARY_PATH
+        val result = Shell.cmd("$busybox grep -l '^1$' /sys/class/net/*/type; true").exec()
+        result.out.mapNotNull { it.trim().removePrefix("/sys/class/net/").removeSuffix("/type").takeIf(String::isNotEmpty) }
+            .filterNot { n -> ETHERNET_SKIP.any { n.startsWith(it) } }
     }
 
     /** Ours, dummies and tunnels: type 1 links a macvlan cannot usefully sit on. */
@@ -637,11 +558,8 @@ object ContainerManager {
 
             val copyResult = installFileDurably(tempConfigFile.absolutePath, configPath)
             if (!copyResult.isSuccess) {
-                // Check both stdout and stderr for error messages
-                val errorOutput = (copyResult.out + copyResult.err).joinToString("\n").trim()
-                val errorMsg = if (errorOutput.isNotEmpty()) errorOutput else "Unknown error (exit code: ${copyResult.code})"
                 tempConfigFile.delete()
-                return@withContext Result.failure(Exception("Failed to update container config: $errorMsg"))
+                return@withContext Result.failure(Exception("Failed to update container config: ${copyResult.errorText()}"))
             }
 
             // Clean up temp config file
@@ -663,7 +581,7 @@ object ContainerManager {
      */
     suspend fun uninstallContainer(
         container: ContainerInfo,
-        logger: ContainerLogger
+        logger: ViewModelLogger
     ): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             logger.i("Starting uninstallation of container: ${container.name}")
@@ -682,24 +600,7 @@ object ContainerManager {
                 logger.i("Executing: $stopCommand")
 
                 val stopResult = Shell.cmd("$stopCommand 2>&1").exec()
-
-                // Log stop command output
-                if (stopResult.out.isNotEmpty()) {
-                    stopResult.out.forEach { line ->
-                        val trimmed = line.trim()
-                        if (trimmed.isNotEmpty()) {
-                            logger.i(trimmed)
-                        }
-                    }
-                }
-                if (stopResult.err.isNotEmpty()) {
-                    stopResult.err.forEach { line ->
-                        val trimmed = line.trim()
-                        if (trimmed.isNotEmpty()) {
-                            logger.e(trimmed)
-                        }
-                    }
-                }
+                logResult(stopResult, logger)
 
                 if (!stopResult.isSuccess) {
                     logger.e("Failed to stop container (exit code: ${stopResult.code})")
@@ -738,37 +639,11 @@ object ContainerManager {
             logger.i("Executing: $deleteCommand")
 
             val deleteResult = Shell.cmd(deleteCommand).exec()
-
-            // Log delete command output
-            if (deleteResult.out.isNotEmpty()) {
-                deleteResult.out.forEach { line ->
-                    val trimmed = line.trim()
-                    if (trimmed.isNotEmpty()) {
-                        logger.i(trimmed)
-                    }
-                }
-            }
-            if (deleteResult.err.isNotEmpty()) {
-                deleteResult.err.forEach { line ->
-                    val trimmed = line.trim()
-                    if (trimmed.isNotEmpty()) {
-                        logger.e(trimmed)
-                    }
-                }
-            }
+            logResult(deleteResult, logger)
 
             if (!deleteResult.isSuccess) {
                 logger.e("Failed to delete container directory (exit code: ${deleteResult.code})")
                 return@withContext Result.failure(Exception("Failed to delete container directory"))
-            }
-
-            // Verify deletion
-            logger.i("")
-            logger.i("Verifying deletion...")
-            val verifyResult = Shell.cmd("test -d ${ContainerCommandBuilder.quote(containerPath)} && echo 'exists' || echo 'deleted' 2>&1").exec()
-            if (verifyResult.out.any { it.contains("exists") }) {
-                logger.e("Warning: Container directory still exists after deletion attempt!")
-                return@withContext Result.failure(Exception("Container directory still exists after deletion"))
             }
 
             logger.i("Container directory successfully deleted.")

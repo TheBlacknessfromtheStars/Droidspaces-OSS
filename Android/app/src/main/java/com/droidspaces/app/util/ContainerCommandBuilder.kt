@@ -29,20 +29,8 @@ object ContainerCommandBuilder {
      * Build start command for a container based on its configuration.
      * Uses the central config file instead of passing all flags individually.
      */
-    fun buildStartCommand(container: ContainerInfo): String {
-        val parts = mutableListOf<String>()
-
-        // Binary path
-        parts.add(DROIDSPACES_BINARY_PATH)
-
-        // Config file path
-        parts.add("--config=${quote(getConfigPath(container))}")
-
-        // Command
-        parts.add("start")
-
-        return parts.joinToString(" ")
-    }
+    fun buildStartCommand(container: ContainerInfo): String =
+        "$DROIDSPACES_BINARY_PATH --config=${quote(getConfigPath(container))} start"
 
     /**
      * Build stop command for a container.
@@ -59,9 +47,9 @@ object ContainerCommandBuilder {
     }
 
     /** JSON status of every running container: OS, hostname, IP, uptime, CPU, RAM. */
-    fun buildShowCommand(): String = "$DROIDSPACES_BINARY_PATH --format show"
+    fun buildShowCommand(): String = "$DROIDSPACES_BINARY_PATH --json show"
 
     /** JSON of every kernel capability probe, one 0/1 per key. */
-    fun buildCheckCommand(): String = "$DROIDSPACES_BINARY_PATH --format check"
+    fun buildCheckCommand(): String = "$DROIDSPACES_BINARY_PATH --json check"
 }
 

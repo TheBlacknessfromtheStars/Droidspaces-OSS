@@ -129,7 +129,7 @@ void print_usage(void) {
       "                            e.g. -B /data:/data,/tmp:/tmp\n"
       "      --reset               Reset config to defaults (keeps "
       "name/rootfs)\n"
-      "      --format              JSON output (show, info, check)\n"
+      "      --json                JSON output (show, info, check)\n"
       "      --help                Show this help message\n\n");
 
   printf(C_BOLD
@@ -140,33 +140,6 @@ void print_usage(void) {
 }
 
 /* Validation Helpers */
-
-static int validate_kernel_version(void) {
-  int major = 0, minor = 0;
-  if (get_kernel_version(&major, &minor) < 0) {
-    ds_error("Failed to detect kernel version.");
-    return -1;
-  }
-
-  if (major < DS_MIN_KERNEL_MAJOR ||
-      (major == DS_MIN_KERNEL_MAJOR && minor < DS_MIN_KERNEL_MINOR)) {
-    printf("\n" C_RED C_BOLD "[ FATAL: UNSUPPORTED KERNEL ]" C_RESET "\n\n");
-    ds_error("Droidspaces requires at least Linux %d.%d.0.",
-             DS_MIN_KERNEL_MAJOR, DS_MIN_KERNEL_MINOR);
-    ds_log("Detected kernel: %d.%d", major, minor);
-    printf("\n" C_DIM
-           "Why? Droidspaces v3 relies on features like OverlayFS and mature\n"
-           "namespace isolation that are only stable on kernels %d.%d+.\n"
-           "Running on this kernel would lead to system instability or "
-           "crashes." C_RESET "\n\n",
-           DS_MIN_KERNEL_MAJOR, DS_MIN_KERNEL_MINOR);
-    ds_log("You can still use " C_BOLD "check, info, help, scan" C_RESET
-           " for diagnostics.");
-    return -1;
-  }
-
-  return 0;
-}
 
 /**
  * CLI-level configuration validation with professional error reporting.
@@ -287,16 +260,10 @@ static int auto_resolve_container_name(struct ds_config *cfg) {
 /* Command Dispatch */
 
 static void enforce_nat_safety(struct ds_config *cfg) {
-  if (cfg->net_mode != DS_NET_HOST) {
-    if (!check_ns(CLONE_NEWNET, "net")) {
-      printf("\n" C_RED C_BOLD
-             "[ FATAL: NETWORK NAMESPACE UNSUPPORTED ]" C_RESET "\n\n");
-      ds_error("Kernel does not support CLONE_NEWNET (network namespaces).");
-      ds_log("Cannot use --net=nat, none, gateway or macvlan.");
-      ds_log("Tip: Use --net=host for shared host networking.");
-      exit(EXIT_FAILURE);
-    }
-  }
+  if (cfg->net_mode != DS_NET_HOST && !check_ns(CLONE_NEWNET, "net"))
+    ds_die("Kernel does not support CLONE_NEWNET (network namespaces), so "
+           "--net=nat, none, gateway and macvlan cannot work. Use --net=host "
+           "for shared host networking.");
 
   /* --upstream and --port are only meaningful with --net=nat.  --upstream is an
    * optional override (auto-detection is the default) - never mandatory. */
@@ -309,45 +276,27 @@ static void enforce_nat_safety(struct ds_config *cfg) {
     cfg->port_forward_count = 0;
   }
 
-  if (cfg->net_mode == DS_NET_GATEWAY) {
-    char reason[512];
-    int probe = ds_nl_probe_nat_capability(reason, sizeof(reason));
-    if (probe < 0 || probe == 1) {
-      printf("\n" C_RED C_BOLD
-             "[ FATAL: GATEWAY NETWORKING UNSUPPORTED ]" C_RESET "\n\n");
-      ds_error("--net=gateway requires NET_NS + VETH + BRIDGE support:\n  %s",
-               reason);
-      ds_log("Tip: use --net=nat/host, or rebuild your kernel with "
-             "CONFIG_VETH=y and CONFIG_BRIDGE=y.");
-      exit(1);
-    }
-    ds_log("[NET] Kernel capability probe passed for --net=gateway.");
-    return;
-  }
-
-  if (cfg->net_mode != DS_NET_NAT)
+  if (cfg->net_mode != DS_NET_NAT && cfg->net_mode != DS_NET_GATEWAY)
     return;
 
+  /* Gateway mode has no bridgeless fallback: the gateway is the bridge. */
+  int gateway = cfg->net_mode == DS_NET_GATEWAY;
+  const char *name = gateway ? "gateway" : "nat";
   char reason[512];
   int probe = ds_nl_probe_nat_capability(reason, sizeof(reason));
-  if (probe < 0) {
-    printf("\n" C_RED C_BOLD "[ FATAL: NAT NETWORKING UNSUPPORTED ]" C_RESET
-           "\n\n");
-    ds_error("--net=nat is not supported on this kernel:\n  %s", reason);
-    ds_log("\nTip: Use --net=host for shared host networking,");
-    ds_log("or rebuild your kernel with CONFIG_BRIDGE=y and CONFIG_VETH=y.");
-    exit(1);
-  }
-
-  if (probe == 1) {
-    cfg->net_bridgeless = 1;
-    ds_log("[NET] Kernel capability probe passed for --net=nat (FALLBACK: No "
-           "BRIDGE)");
-  } else {
-    cfg->net_bridgeless = 0;
-    ds_log("[NET] Kernel capability probe passed for --net=nat (Full BRIDGE)");
-  }
+  if (probe < 0 || (gateway && probe == 1))
+    ds_die("--net=%s is not supported on this kernel: %s. Use --net=host for "
+           "shared host networking, or rebuild your kernel with "
+           "CONFIG_BRIDGE=y and CONFIG_VETH=y.",
+           name, reason);
+  cfg->net_bridgeless = !gateway && probe == 1;
+  ds_log("[NET] Kernel capability probe passed for --net=%s%s.", name,
+         cfg->net_bridgeless ? " (FALLBACK: No BRIDGE)" : "");
 }
+
+/* Every short flag. A letter missing here is rejected as an unknown option
+ * even though long_options maps it, so keep the two in sync. */
+#define DS_OPTSTRING "r:i:n:h:d:fHXPISvVB:C:E:u:"
 
 static struct option long_options[] = {
     {"rootfs", required_argument, 0, 'r'},
@@ -394,13 +343,28 @@ static struct option long_options[] = {
     {"macvlan-parent", required_argument, 0, 281},
     {"macvlan-mode", required_argument, 0, 282},
     {"reset", no_argument, 0, 256},
-    {"format", no_argument, 0, 265},
+    {"json", no_argument, 0, 265},
     {"memory", required_argument, 0, 266},
     {"cpus", required_argument, 0, 267},
     {"pids-limit", required_argument, 0, 268},
     {"init", required_argument, 0, 269},
     {"help", no_argument, 0, 'v'},
     {0, 0, 0, 0}};
+
+/* The command word in argv: the first argument that is neither an option nor
+ * the value one takes, found with the real option table so a flag without a
+ * value cannot hide it. NULL when there is none. Resets getopt. */
+const char *ds_command_word(int argc, char **argv) {
+  const char *cmd = NULL;
+  int opt;
+  optind = 0;
+  while (!cmd && (opt = getopt_long(argc, argv, "-" DS_OPTSTRING, long_options,
+                                    NULL)) != -1)
+    if (opt == 1)
+      cmd = optarg;
+  optind = 0;
+  return cmd;
+}
 
 /* The CLI override pass: apply every flag in argv on top of whatever cfg
  * already holds (defaults or a disk load). main runs it as pass 3 of its
@@ -411,11 +375,9 @@ static struct option long_options[] = {
 int ds_apply_cli_overrides(int argc, char **argv, struct ds_config *cfg,
                            int strict) {
   int opt;
-  enum ds_net_mode cli_net_mode = DS_NET_HOST;
 
   /* Strict mode for 'run' prevents stealing arguments from the sub-command. */
-  const char *optstring =
-      strict ? "+r:i:n:h:d:fHXPvVB:C:E:u:" : "r:i:n:h:d:fHXPvVB:C:E:u:";
+  const char *optstring = strict ? "+" DS_OPTSTRING : DS_OPTSTRING;
 
   /* --reset must wipe the config BEFORE the other flags land on top, but
    * getopt hands us options in argv order. Scan for it first so
@@ -424,7 +386,7 @@ int ds_apply_cli_overrides(int argc, char **argv, struct ds_config *cfg,
   optind = 0;
   while ((opt = getopt_long(argc, argv, optstring, long_options, NULL)) != -1) {
     if (opt == 256) {
-      apply_reset_config(cfg, 0, DS_NET_HOST);
+      apply_reset_config(cfg);
       break;
     }
   }
@@ -552,49 +514,15 @@ int ds_apply_cli_overrides(int argc, char **argv, struct ds_config *cfg,
       char *dup = strdup(optarg);
       if (!dup)
         return -1;
-      char *saveptr;
-      char *token = strtok_r(dup, ",", &saveptr);
-      while (token) {
-        char *sep = strchr(token, ':');
-        if (!sep) {
-          ds_error("Invalid bind mount format: %s (expected SRC:DEST[:ro])",
-                   token);
-          free(dup);
-          return -1;
-        }
-        *sep = '\0';
-        const char *src = token;
-        char *rest = sep + 1;
-
-        /* Parse optional :ro flag after dest */
-        int ro = 0;
-        char *flag_sep = strchr(rest, ':');
-        if (flag_sep) {
-          *flag_sep = '\0';
-          ro = (strcmp(flag_sep + 1, "ro") == 0) ? 1 : 0;
-        }
-        const char *dest = rest;
-
-        if (dest[0] != '/') {
-          ds_error("Bind destination must be an absolute path: %s", dest);
-          free(dup);
-          return -1;
-        }
-        if (!validate_bind_destination(dest)) {
-          ds_error("Unsafe bind destination '%s': it must name a path inside "
-                   "the container, not / itself, with no '.', '..' or control "
-                   "characters.",
-                   dest);
-          free(dup);
-          return -1;
-        }
-        if (ds_config_add_bind(cfg, src, dest, ro) < 0) {
-          free(dup);
-          return -1;
-        }
-        token = strtok_r(NULL, ",", &saveptr);
-      }
+      char err[256], *saveptr;
+      int rc = 0;
+      for (char *tok = strtok_r(dup, ",", &saveptr); tok && rc == 0;
+           tok = strtok_r(NULL, ",", &saveptr))
+        if ((rc = ds_parse_bind_spec(tok, cfg, err, sizeof(err))) < 0)
+          ds_error("%s", err);
       free(dup);
+      if (rc < 0)
+        return -1;
       break;
     }
     case 'v':
@@ -608,186 +536,26 @@ int ds_apply_cli_overrides(int argc, char **argv, struct ds_config *cfg,
                  optarg);
         return -1;
       }
-      cli_net_mode = (enum ds_net_mode)mode;
-      cfg->net_mode = cli_net_mode;
+      cfg->net_mode = (enum ds_net_mode)mode;
       break;
     }
     case 264:
-      parse_privileged(optarg, cfg);
+      if (parse_privileged(optarg, cfg) < 0) {
+        ds_error("--privileged refused");
+        return -1;
+      }
       break;
 
     case 258: {
-      /* --port HOST:CONTAINER[/proto]  (comma-separated list allowed), supports
-       * ranges */
-      char tmp[1024];
+      /* --port HOST[:CONTAINER][/proto], comma-separated, ranges allowed */
+      char tmp[1024], err[128], *saveptr;
       safe_strncpy(tmp, optarg, sizeof(tmp));
-      char *saveptr;
-      char *tok = strtok_r(tmp, ",", &saveptr);
-      while (tok) {
-        if (cfg->port_forward_count >= DS_MAX_PORT_FORWARDS) {
-          ds_error("Too many --port mappings (max %d)", DS_MAX_PORT_FORWARDS);
+      for (char *tok = strtok_r(tmp, ",", &saveptr); tok;
+           tok = strtok_r(NULL, ",", &saveptr))
+        if (ds_parse_port_forward(tok, cfg, err, sizeof(err)) < 0) {
+          ds_error("%s in --port", err);
           return -1;
         }
-
-        while (*tok == ' ' || *tok == '\t')
-          tok++;
-
-        struct ds_port_forward *pf =
-            &cfg->port_forwards[cfg->port_forward_count];
-        memset(pf, 0, sizeof(*pf));
-        strncpy(pf->proto, "tcp", sizeof(pf->proto));
-
-        /* Strip optional /proto suffix */
-        char *slash = strchr(tok, '/');
-        if (slash) {
-          *slash = '\0';
-          strncpy(pf->proto, slash + 1, sizeof(pf->proto) - 1);
-          pf->proto[sizeof(pf->proto) - 1] = '\0';
-          if (strcmp(pf->proto, "tcp") != 0 && strcmp(pf->proto, "udp") != 0) {
-            ds_error("Invalid protocol '%s' in --port (use tcp or udp)",
-                     pf->proto);
-            return -1;
-          }
-        }
-
-        /* Split HOST:CONTAINER or symmetric PORT */
-        char *host_side = tok;
-        char *cont_side = tok;
-        char *colon = strchr(tok, ':');
-        if (colon) {
-          *colon = '\0';
-          cont_side = colon + 1;
-        }
-
-        int valid = 1;
-        /* Host side parsing */
-        {
-          char *dash = strchr(host_side, '-');
-          if (dash) {
-            int a = atoi(host_side), b = atoi(dash + 1);
-            if (a <= 0 || a > 65535 || b < a || b > 65535) {
-              ds_error("Invalid host port range '%s' in --port", host_side);
-              valid = 0;
-            } else {
-              pf->host_port = (uint16_t)a;
-              pf->host_port_end = (uint16_t)b;
-            }
-          } else {
-            int p = atoi(host_side);
-            if (p <= 0 || p > 65535) {
-              ds_error("Invalid host port '%s' in --port", host_side);
-              valid = 0;
-            } else {
-              pf->host_port = (uint16_t)p;
-              pf->host_port_end = 0;
-            }
-          }
-        }
-
-        /* Container side parsing */
-        if (valid) {
-          char *dash = strchr(cont_side, '-');
-          if (dash) {
-            int a = atoi(cont_side), b = atoi(dash + 1);
-            if (a <= 0 || a > 65535 || b < a || b > 65535) {
-              ds_error("Invalid container port range '%s' in --port",
-                       cont_side);
-              valid = 0;
-            } else {
-              pf->container_port = (uint16_t)a;
-              pf->container_port_end = (uint16_t)b;
-            }
-          } else {
-            int p = atoi(cont_side);
-            if (p <= 0 || p > 65535) {
-              ds_error("Invalid container port '%s' in --port", cont_side);
-              valid = 0;
-            } else {
-              pf->container_port = (uint16_t)p;
-              pf->container_port_end = 0;
-            }
-          }
-        }
-
-        if (!valid) {
-          return -1;
-        }
-
-        /* Width mismatch check */
-        int hw = pf->host_port_end ? (pf->host_port_end - pf->host_port) : 0;
-        int cw = pf->container_port_end
-                     ? (pf->container_port_end - pf->container_port)
-                     : 0;
-        if (hw != cw) {
-          ds_error(
-              "Port range width mismatch in --port: host %d vs container %d",
-              hw + 1, cw + 1);
-          return -1;
-        }
-
-        /* Conflict/Intersection check - Venn diagram logic:
-         * Reject if host OR container ranges overlap with any existing rule
-         * of the same protocol.  Two ranges [s1,e1] and [s2,e2] overlap
-         * iff s1 <= e2 && s2 <= e1. */
-        for (int i = 0; i < cfg->port_forward_count; i++) {
-          struct ds_port_forward *ex = &cfg->port_forwards[i];
-          if (strcmp(ex->proto, pf->proto) != 0)
-            continue;
-
-          /* Exact duplicate - silently skip */
-          if (pf->host_port == ex->host_port &&
-              pf->host_port_end == ex->host_port_end &&
-              pf->container_port == ex->container_port &&
-              pf->container_port_end == ex->container_port_end) {
-            goto skip_tok;
-          }
-
-          /* Host-side overlap */
-          uint16_t hs1 = pf->host_port,
-                   he1 = pf->host_port_end ? pf->host_port_end : pf->host_port;
-          uint16_t hs2 = ex->host_port,
-                   he2 = ex->host_port_end ? ex->host_port_end : ex->host_port;
-          int host_overlap = (hs1 <= he2 && hs2 <= he1);
-
-          /* Container-side overlap */
-          uint16_t cs1 = pf->container_port, ce1 = pf->container_port_end
-                                                       ? pf->container_port_end
-                                                       : pf->container_port;
-          uint16_t cs2 = ex->container_port, ce2 = ex->container_port_end
-                                                       ? ex->container_port_end
-                                                       : ex->container_port;
-          int cont_overlap = (cs1 <= ce2 && cs2 <= ce1);
-
-          if (host_overlap || cont_overlap) {
-            char pf_str[32], ex_str[32];
-            const char *side = host_overlap ? "Host" : "Container";
-
-            if (host_overlap) {
-              snprintf(pf_str, sizeof(pf_str), "%u%s%u", pf->host_port,
-                       pf->host_port_end ? "-" : "", pf->host_port_end);
-              snprintf(ex_str, sizeof(ex_str), "%u%s%u", ex->host_port,
-                       ex->host_port_end ? "-" : "", ex->host_port_end);
-            } else {
-              snprintf(pf_str, sizeof(pf_str), "%u%s%u", pf->container_port,
-                       pf->container_port_end ? "-" : "",
-                       pf->container_port_end);
-              snprintf(ex_str, sizeof(ex_str), "%u%s%u", ex->container_port,
-                       ex->container_port_end ? "-" : "",
-                       ex->container_port_end);
-            }
-
-            ds_warn("%s port conflict: %s/%s overlaps with existing "
-                    "mapping %s/%s - skipping",
-                    side, pf_str, pf->proto, ex_str, ex->proto);
-            goto skip_tok;
-          }
-        }
-
-        cfg->port_forward_count++;
-
-      skip_tok:
-        tok = strtok_r(NULL, ",", &saveptr);
-      }
       break;
     }
 
@@ -830,8 +598,8 @@ int ds_apply_cli_overrides(int argc, char **argv, struct ds_config *cfg,
       cfg->gpu_mode = 1;
       break;
     case 265:
-      /* --format: JSON output */
-      cfg->format_output = 1;
+      /* --json: JSON output */
+      cfg->json_output = 1;
       break;
 
     case 266: {
@@ -898,17 +666,7 @@ int main(int argc, char **argv) {
   int ret = 0;
   struct ds_config cfg;
   char raw_names[4096] = "";
-  /* CRITICAL: Zero all fields to avoid garbage pointer in dynamic arrays */
-  memset(&cfg, 0, sizeof(cfg));
-
-  /* Initialise pipe fds to -1 so accidental close(-1) is harmless */
-  cfg.net_ready_pipe[0] = cfg.net_ready_pipe[1] = -1;
-  cfg.net_done_pipe[0] = cfg.net_done_pipe[1] = -1;
-
-  /* DS_NET_HOST is the enum's zero value because the socketd wire format
-   * pins 0=host, so the zeroed struct must be corrected: NAT is the default,
-   * a saved config or --net overrides it below. */
-  cfg.net_mode = DS_NET_NAT;
+  ds_config_init(&cfg);
 
   safe_strncpy(cfg.prog_name, argv[0], sizeof(cfg.prog_name));
 
@@ -937,8 +695,19 @@ int main(int argc, char **argv) {
 
   /* 1. Discovery Pass: Capture identity and command without permuting argv.
    * Using '-' at the start of optstring returns non-options as '1'. */
-  while ((opt = getopt_long(argc, argv, "-r:i:n:h:d:fHXPvVB:C:E:u:",
-                            long_options, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "-" DS_OPTSTRING, long_options,
+                            NULL)) != -1) {
+    if (opt == '?') {
+      /* opterr is 0, so this is the only word the user gets. optopt names a
+       * bad short letter; for a long option it is 0 and optind has moved
+       * past the word. */
+      if (optopt)
+        ds_error("Unknown or incomplete option: -%c", optopt);
+      else
+        ds_error("Unknown or incomplete option: %s", argv[optind - 1]);
+      ret = 1;
+      goto cleanup;
+    }
     if (opt == 1) { /* Non-option argument */
       if (!discovered_cmd) {
         discovered_cmd = optarg;
@@ -1115,9 +884,13 @@ int main(int argc, char **argv) {
                  sizeof(ds_log_container_name));
   }
 
+  /* The NAT probe check runs stamps its verdict under Net/, so the workspace
+   * comes first. A non-root check cannot create it and mkdir_p stays quiet. */
+  ensure_workspace();
+
   /* Basic info commands */
   if (strcmp(cmd, "check") == 0) {
-    ret = check_requirements_detailed(cfg.format_output);
+    ret = check_requirements_detailed(cfg.json_output);
     goto cleanup;
   }
   if (strcmp(cmd, "version") == 0) {
@@ -1142,8 +915,6 @@ int main(int argc, char **argv) {
     goto cleanup;
   }
 
-  ensure_workspace();
-
   if (strcmp(cmd, "show") == 0) {
     ret = show_containers(&cfg);
     goto cleanup;
@@ -1166,10 +937,6 @@ int main(int argc, char **argv) {
       ret = 1;
       goto cleanup;
     }
-    if (validate_kernel_version() < 0) {
-      ret = 1;
-      goto cleanup;
-    }
     if (check_requirements_hw(cfg.hw_access) < 0) {
       ret = 1;
       goto cleanup;
@@ -1177,9 +944,6 @@ int main(int argc, char **argv) {
     enforce_nat_safety(&cfg);
     print_ds_banner();
     ds_cgroup_host_bootstrap(cfg.force_cgroupv1);
-    if (cfg.container_name[0] == '\0' && cfg.rootfs_path[0])
-      generate_container_name(cfg.rootfs_path, cfg.container_name,
-                              sizeof(cfg.container_name));
     ret = start_rootfs(&cfg);
     goto cleanup;
   }
@@ -1223,20 +987,12 @@ int main(int argc, char **argv) {
   }
 
   if (strcmp(cmd, "enter") == 0) {
-    if (validate_kernel_version() < 0) {
-      ret = 1;
-      goto cleanup;
-    }
     const char *user = (optind + 1 < argc) ? argv[optind + 1] : "root";
     ret = enter_rootfs(&cfg, user);
     goto cleanup;
   }
 
   if (strcmp(cmd, "run") == 0) {
-    if (validate_kernel_version() < 0) {
-      ret = 1;
-      goto cleanup;
-    }
     /* run [--] <cmd>: a leading "--" fences off a command that itself starts
      * with a dash, the way env(1) takes it. */
     char **run_argv = argv + optind + 1;

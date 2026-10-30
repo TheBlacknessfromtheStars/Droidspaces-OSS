@@ -518,11 +518,11 @@ int ds_net_check_ip_collision(const char *ip_str, const char *exclude_name) {
              containers_dir, ent->d_name);
 
     struct ds_config other;
-    memset(&other, 0, sizeof(other));
-    other.net_ready_pipe[0] = other.net_ready_pipe[1] = -1;
-    other.net_done_pipe[0] = other.net_done_pipe[1] = -1;
+    ds_config_init(&other);
 
-    if (ds_config_load(config_path, &other) == 0) {
+    /* By path: this runs inside the auto-assign loop, and a by-name load
+     * costs a /proc scan per directory. */
+    if (ds_config_peek_path(config_path, &other) == 0) {
       if (other.static_nat_ip[0] && strcmp(other.static_nat_ip, ip_str) == 0)
         collision = 1;
       ds_config_free(&other);
@@ -1277,11 +1277,9 @@ static void gateway_segment_unlock(int fd) {
 /* Resolve the gateway container's init pid, or 0 if it is not running. */
 static pid_t gateway_pid_of(const char *name) {
   struct ds_config c;
-  memset(&c, 0, sizeof(c));
-  c.net_ready_pipe[0] = c.net_ready_pipe[1] = -1;
-  c.net_done_pipe[0] = c.net_done_pipe[1] = -1;
+  ds_config_init(&c);
   safe_strncpy(c.container_name, name, sizeof(c.container_name));
-  (void)ds_config_load_by_name(name, &c);
+  (void)ds_config_peek(name, &c);
   pid_t p = 0;
   if (!is_container_running(&c, &p))
     p = 0;
@@ -1649,7 +1647,7 @@ void ds_net_rewire_gateway_clients(const char *gateway_name,
       continue;
 
     struct ds_config c = {0};
-    if (ds_config_load_by_name(ent->d_name, &c) != 0)
+    if (ds_config_peek(ent->d_name, &c) != 0)
       continue;
 
     pid_t p = 0;
@@ -1704,7 +1702,7 @@ void ds_net_gateway_teardown(const char *gateway_name) {
       continue;
 
     struct ds_config c = {0};
-    if (ds_config_load_by_name(ent->d_name, &c) != 0)
+    if (ds_config_peek(ent->d_name, &c) != 0)
       continue;
 
     if (!(c.net_mode == DS_NET_GATEWAY && c.gateway_container[0] &&
@@ -1828,7 +1826,7 @@ static int macvlan_parent_taken(const struct ds_config *cfg, char *who,
     if (ent->d_name[0] == '.')
       continue;
     struct ds_config c = {0};
-    if (ds_config_load_by_name(ent->d_name, &c) != 0)
+    if (ds_config_peek(ent->d_name, &c) != 0)
       continue;
     pid_t p = 0;
     if (c.net_mode == DS_NET_MACVLAN &&
@@ -2130,7 +2128,8 @@ int fix_networking_rootfs(struct ds_config *cfg) {
  * with no IPv4 the uplink comes and goes with an IPv6 default route.
  *
  * A 1.5s heartbeat covers devices with broken netlink notifications and
- * re-asserts ip_forward, which Android periodically resets. */
+ * re-asserts ip_forward, which Android periodically resets. On Linux the
+ * monitor runs too, for the forwarding and the netfilter reconcile only. */
 
 /* Last detected uplink interface.  Suppresses the "[NET] active uplink:"
  * log line on every heartbeat - only log when the result changes. */
@@ -2361,8 +2360,10 @@ static void do_uplink_reprobe(void) {
    *
    * Nothing notifies us, so reconcile instead of assuming the one-time setup
    * survived.  This runs even with no uplink at all, since host <-> container
-   * traffic over the bridge needs the policy rules regardless of WAN state. */
-  install_policy_rules(ctx);
+   * traffic over the bridge needs the policy rules regardless of WAN state.
+   * The policy rules are Android's; a Linux host routes from main. */
+  if (is_android())
+    install_policy_rules(ctx);
 
   /* The netfilter set is gated behind a fork-free probe of every rule in it:
    * the port-forward helpers shell out to the iptables binary, so they must
@@ -2378,6 +2379,13 @@ static void do_uplink_reprobe(void) {
     ds_warn("[NET] Route monitor: host netfilter rules are missing "
             "(netd restart or firewall app?) - reinstalling");
     install_netfilter_rules();
+  }
+
+  /* Everything below points Android's per-network tables at the uplink. A
+   * Linux host has one main table, which already follows the default route. */
+  if (!is_android()) {
+    ds_nl_close(ctx);
+    return;
   }
 
   char new_iface[IFNAMSIZ] = {0};
@@ -2507,11 +2515,14 @@ static void *route_monitor_loop(void *arg) {
   while (!g_stop_monitor) {
     /* Enforce IPv4 forwarding in real-time. If ip_forward ever flips to 0
      * the NAT'd container loses all WAN traffic, so re-assert it on every
-     * cycle. Android's netd is the culprit, and this thread only runs there.
-     * The kernel does not broadcast POLLERR/inotify events for /proc/sys/
-     * memory variables, so we must poll; reading a 1-byte procfs flag takes
-     * < 1 microsecond, costing 0% CPU. */
-    if (g_current_gw_table > 0) {
+     * cycle. Android's netd resets it, and on Linux any other tool that
+     * restores its own saved value on exit (a USB tether, a VPN) does the
+     * same. Android only needs it while an IPv4 uplink is wired; a Linux host
+     * has no per-network table to wait for. The kernel does not broadcast
+     * POLLERR/inotify events for /proc/sys/ memory variables, so we must
+     * poll; reading a 1-byte procfs flag takes < 1 microsecond, costing 0%
+     * CPU. */
+    if (g_current_gw_table > 0 || !is_android()) {
       char val[4] = {0};
       if (read_file("/proc/sys/net/ipv4/ip_forward", val, sizeof(val)) > 0 &&
           val[0] == '0') {
@@ -2711,9 +2722,6 @@ void ds_net_stop_route_monitor(void) {
 void ds_net_mark_local_forward_active(void) { g_local_forward_active = 1; }
 
 void ds_net_start_route_monitor(const char *container_name) {
-  if (!is_android())
-    return;
-
   pthread_mutex_lock(&g_gw_mutex);
   /* Idempotent: exactly one monitor thread per process.  setup_veth_host_side
    * calls this on every boot cycle (including reboots); the monitor tracks the

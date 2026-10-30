@@ -6,7 +6,6 @@
  */
 
 #include "droidspace.h"
-#include "socketd_protocol.h"
 #include <ftw.h>
 #include <grp.h>
 #include <pwd.h>
@@ -110,82 +109,37 @@ char *ds_resolve_path_arg(const char *path) {
   if (!path || !*path)
     return strdup("");
 
-  const char *p = path;
-  char *to_free = NULL;
-
-  /* Handle ~/ expansion */
-  if (p[0] == '~' && (p[1] == '/' || p[1] == '\0')) {
-    const char *home = getenv("HOME");
-    if (home) {
-      size_t hlen = strlen(home);
-      size_t plen = strlen(p + 1);
-      to_free = malloc(hlen + plen + 1);
-      if (to_free) {
-        memcpy(to_free, home, hlen);
-        memcpy(to_free + hlen, p + 1, plen + 1);
-        p = to_free;
-      }
-    }
+  /* A ~ still reaches us inside a comma list or an =value the shell did not
+   * expand. */
+  char home[PATH_MAX];
+  if (path[0] == '~' && (path[1] == '/' || !path[1]) && getenv("HOME")) {
+    snprintf(home, sizeof(home), "%s%s", getenv("HOME"), path + 1);
+    path = home;
   }
 
-  if (p[0] == '/') {
-    char *res = strdup(p);
-    if (res) {
-      size_t len = strlen(res);
-      while (len > 1 && res[len - 1] == '/') {
-        res[len - 1] = '\0';
-        len--;
-      }
-    }
-    free(to_free);
+  if (path[0] == '/') {
+    char *res = strdup(path);
+    for (size_t len = res ? strlen(res) : 0; len > 1 && res[len - 1] == '/';)
+      res[--len] = '\0';
     return res;
   }
 
   /* Fast path: realpath handles .., symlinks, and validates existence. */
   char resolved[PATH_MAX];
-  if (realpath(p, resolved)) {
-    free(to_free);
+  if (realpath(path, resolved))
     return strdup(resolved);
-  }
 
-  /* Path does not exist yet - build an absolute path from the current CWD.
-   * Strip leading ./ noise before joining so the result stays clean. */
-  const char *suffix = p;
+  /* Not there yet (a rootfs image about to be created, say): join it to the
+   * cwd, minus any leading ./ noise. */
+  const char *suffix = path;
   while (suffix[0] == '.' && suffix[1] == '/')
     suffix += 2;
-  if (!*suffix) {
-    /* Input was pure "./" - resolve to CWD itself. */
-    char cwd[PATH_MAX];
-    char *res = strdup(getcwd(cwd, sizeof(cwd)) ? cwd : ".");
-    free(to_free);
-    return res;
-  }
-
-  char cwd[PATH_MAX];
-  if (!getcwd(cwd, sizeof(cwd))) {
-    char *res = strdup(p);
-    free(to_free);
-    return res;
-  }
-
-  size_t clen = strlen(cwd), plen = strlen(suffix);
-  if (clen + 1 + plen >= PATH_MAX) {
-    char *res = strdup(p);
-    free(to_free);
-    return res;
-  }
-
-  char *out = malloc(clen + 1 + plen + 1);
-  if (!out) {
-    char *res = strdup(p);
-    free(to_free);
-    return res;
-  }
-  memcpy(out, cwd, clen);
-  out[clen] = '/';
-  memcpy(out + clen + 1, suffix, plen + 1); /* copies the NUL terminator */
-  free(to_free);
-  return out;
+  char cwd[PATH_MAX], *out = NULL;
+  if (!getcwd(cwd, sizeof(cwd)))
+    return strdup(path);
+  if (!*suffix)
+    return strdup(cwd);
+  return asprintf(&out, "%s/%s", cwd, suffix) < 0 ? strdup(path) : out;
 }
 
 /*
@@ -195,72 +149,31 @@ char *ds_resolve_path_arg(const char *path) {
  * container namespace and is always absolute by convention.
  */
 static char *resolve_bind_src(const char *val) {
-  if (!val)
-    return strdup("");
-
-  size_t len = strlen(val);
-  size_t tokens = 1;
-  for (size_t i = 0; i < len; i++) {
-    if (val[i] == ',')
-      tokens++;
-  }
-
-  if (tokens > (SIZE_MAX - len - 1) / PATH_MAX)
-    return strdup(val);
-
-  /* Worst case: every token expands to PATH_MAX.
-   * Use the heap - not the stack - to avoid blowing the stack in the daemon
-   * handler process (which may have a smaller stack than main). */
-  size_t bufsz = len + PATH_MAX * tokens + 1;
-  char *copy = malloc(bufsz);
-  char *out = malloc(bufsz);
-  if (!copy || !out) {
+  char *copy = strdup(val), *out = NULL;
+  size_t size = 0;
+  FILE *f = copy ? open_memstream(&out, &size) : NULL;
+  if (!f) {
     free(copy);
+    return strdup(val);
+  }
+  char *sv;
+  int first = 1;
+  for (char *tok = strtok_r(copy, ",", &sv); tok;
+       tok = strtok_r(NULL, ",", &sv), first = 0) {
+    char *col = strchr(tok, ':');
+    if (col)
+      *col = '\0';
+    char *src = ds_resolve_path_arg(tok);
+    fprintf(f, "%s%s%s%s", first ? "" : ",", src ? src : tok, col ? ":" : "",
+            col ? col + 1 : "");
+    free(src);
+  }
+  free(copy);
+  if (fclose(f) != 0) {
     free(out);
     return strdup(val);
   }
-  memcpy(copy, val, len + 1);
-  out[0] = '\0';
-
-  char *sv, *tok = strtok_r(copy, ",", &sv);
-  int first = 1;
-  size_t off = 0;
-
-  while (tok) {
-    char *col = strchr(tok, ':');
-    const char *dest = col ? col + 1 : "";
-    if (col)
-      *col = '\0';
-
-    char *abs_src = ds_resolve_path_arg(tok);
-    const char *src = abs_src ? abs_src : tok;
-
-    if (off >= bufsz) {
-      free(abs_src);
-      free(copy);
-      free(out);
-      return strdup(val);
-    }
-
-    size_t avail = bufsz - off;
-    int n = snprintf(out + off, avail, "%s%s%s%s", first ? "" : ",", src,
-                     col ? ":" : "", dest);
-    if (n < 0 || (size_t)n >= avail) {
-      free(abs_src);
-      free(copy);
-      free(out);
-      return strdup(val);
-    }
-    off += (size_t)n;
-    free(abs_src);
-    first = 0;
-    tok = strtok_r(NULL, ",", &sv);
-  }
-
-  free(copy);
-  char *result = strdup(out);
-  free(out);
-  return result;
+  return out;
 }
 
 /*
@@ -361,13 +274,6 @@ int is_subpath(const char *parent, const char *child) {
   return result;
 }
 
-int is_running_in_termux(void) {
-  if (getenv("TERMUX_VERSION") || getenv("TERMUX_APP__PACKAGE_NAME") ||
-      getenv("TERMUX__PREFIX") || getenv("TERMUX_APP__APP_VERSION_CODE"))
-    return 1;
-  return 0;
-}
-
 int mkdir_p(const char *path, mode_t mode) {
   char tmp[PATH_MAX];
   char *p = NULL;
@@ -448,8 +354,10 @@ int write_file_atomic(const char *path, const char *content) {
   if (ok && fchmod(fd, 0644) < 0)
     ok = 0;
 
-  /* fsync before rename - ensures data hits disk on Android before reboot. */
-  if (ok && fsync(fd) < 0)
+  /* Without the fsync the rename can reach disk before the data, and a hard
+   * reboot leaves an empty file. EINVAL means the filesystem has no fsync,
+   * the write itself still landed. */
+  if (ok && fsync(fd) < 0 && errno != EINVAL)
     ok = 0;
   close(fd);
 
@@ -612,58 +520,6 @@ int build_proc_root_path(pid_t pid, const char *suffix, char *buf,
   else
     r = snprintf(buf, size, DS_PROC_ROOT_FMT, pid);
   return (r > 0 && (size_t)r < size) ? 0 : -1;
-}
-
-int parse_os_release(const char *rootfs_path, char *id_out, char *ver_out,
-                     size_t out_size) {
-  char path[PATH_MAX];
-  snprintf(path, sizeof(path), "%.4000s" DS_OS_RELEASE, rootfs_path);
-
-  char buf[4096];
-  if (read_file(path, buf, sizeof(buf)) < 0)
-    return -1;
-
-  /* Default values */
-  safe_strncpy(id_out, "linux", out_size);
-  if (ver_out)
-    ver_out[0] = '\0';
-
-  /* Parse ID */
-  char *p = strstr(buf, "\nID=");
-  if (!p && strncmp(buf, "ID=", 3) == 0)
-    p = buf;
-
-  if (p) {
-    if (*p == '\n')
-      p++;
-    p += 3;
-    if (*p == '"')
-      p++;
-    int i = 0;
-    while (p[i] && p[i] != '"' && p[i] != '\n' && (size_t)i < out_size - 1) {
-      id_out[i] = p[i];
-      i++;
-    }
-    id_out[i] = '\0';
-  }
-
-  /* Parse VERSION_ID */
-  if (ver_out) {
-    p = strstr(buf, "VERSION_ID=");
-    if (p) {
-      p += 11;
-      if (*p == '"')
-        p++;
-      int i = 0;
-      while (p[i] && p[i] != '"' && p[i] != '\n' && (size_t)i < out_size - 1) {
-        ver_out[i] = p[i];
-        i++;
-      }
-      ver_out[i] = '\0';
-    }
-  }
-
-  return 0;
 }
 
 /* Grep file for a pattern (simple substring search) */
@@ -1048,6 +904,18 @@ void rotate_log(const char *path, size_t max_size) {
   }
 }
 
+/* <workspace>/Logs/<name>/<file>, with the directory in place and the file
+ * rotated at 2 MB. */
+void container_log_path(const char *name, const char *file, char *buf,
+                        size_t size) {
+  char safe[256], dir[PATH_MAX];
+  sanitize_container_name(name, safe, sizeof(safe));
+  snprintf(dir, sizeof(dir), "%.3800s/%.256s", get_logs_dir(), safe);
+  mkdir_p(dir, 0755);
+  snprintf(buf, size, "%.4080s/%.32s", dir, file);
+  rotate_log(buf, 2 * 1024 * 1024);
+}
+
 static void write_to_log_file(const char *name, const char *component,
                               const char *raw_msg, int pre_opened_fd) {
   if (!name || !name[0])
@@ -1081,17 +949,8 @@ static void write_to_log_file(const char *name, const char *component,
   }
 
   /* Fallback: open by path (pre-pivot, monitor process, etc.) */
-  char log_dir[PATH_MAX];
-  char safe_log_name[256];
-  sanitize_container_name(name, safe_log_name, sizeof(safe_log_name));
-  snprintf(log_dir, sizeof(log_dir), "%.2048s/" DS_LOGS_SUBDIR "/%.256s",
-           get_workspace_dir(), safe_log_name);
-  mkdir_p(log_dir, 0755);
-
   char log_path[PATH_MAX];
-  snprintf(log_path, sizeof(log_path), "%.4090s/log", log_dir);
-
-  rotate_log(log_path, 2 * 1024 * 1024);
+  container_log_path(name, "log", log_path, sizeof(log_path));
 
   FILE *f = fopen(log_path, "ae"); /* append + close-on-exec */
   if (!f)
@@ -1105,6 +964,11 @@ static void write_to_log_file(const char *name, const char *component,
 
 void ds_log_internal(const char *prefix, const char *color, int is_err,
                      const char *fmt, ...) {
+  /* A peek (ds_config_peek) at a config file prints none of the file's
+   * complaints; errors are the command's own, so they still go out. */
+  if (ds_log_silent == DS_LOG_PEEK && prefix[0] != '-')
+    return;
+
   char raw_msg[8192];
   va_list ap;
   va_start(ap, fmt);
@@ -1121,23 +985,10 @@ void ds_log_internal(const char *prefix, const char *color, int is_err,
   if (ds_log_silent && !is_err)
     return;
 
-  /* Filter out these prefixes from terminal output */
-  if (!is_err) {
-    if (strncmp(raw_msg, "[DEBUG]", 7) == 0 ||
-        strncmp(raw_msg, "[CGROUP]", 8) == 0 ||
-        strncmp(raw_msg, "[VIRT]", 6) == 0 ||
-        strncmp(raw_msg, "[IPT]", 5) == 0 ||
-        strncmp(raw_msg, "[NET]", 5) == 0 ||
-        strncmp(raw_msg, "[SEC]", 5) == 0 ||
-        strncmp(raw_msg, "[GPU]", 5) == 0 || strncmp(raw_msg, "[FW]", 4) == 0 ||
-        strncmp(raw_msg, "[DHCP]", 6) == 0 ||
-        strncmp(raw_msg, "[VirGL]", 7) == 0 ||
-        strncmp(raw_msg, "[PulseAudio]", 12) == 0 ||
-        strncmp(raw_msg, "[X11]", 5) == 0 ||
-        strncmp(raw_msg, "[Anland]", 8) == 0) {
-      return;
-    }
-  }
+  /* Tagged lines, "[NET] ..." and the like, are subsystem chatter for the
+   * log file; the terminal gets the untagged ones. */
+  if (!is_err && raw_msg[0] == '[')
+    return;
 
   FILE *out = is_err ? stderr : stdout;
   fprintf(out,
@@ -1182,18 +1033,8 @@ void ds_open_container_log(struct ds_config *cfg) {
   if (!cfg || !cfg->container_name[0])
     return;
 
-  char log_dir[PATH_MAX];
-  char safe_log_name[256];
-  sanitize_container_name(cfg->container_name, safe_log_name,
-                          sizeof(safe_log_name));
-  snprintf(log_dir, sizeof(log_dir), "%.2048s/" DS_LOGS_SUBDIR "/%.256s",
-           get_workspace_dir(), safe_log_name);
-  mkdir_p(log_dir, 0755);
-
   char log_path[PATH_MAX];
-  snprintf(log_path, sizeof(log_path), "%.4090s/log", log_dir);
-
-  rotate_log(log_path, 2 * 1024 * 1024);
+  container_log_path(cfg->container_name, "log", log_path, sizeof(log_path));
 
   int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
   if (fd >= 0)
@@ -1213,186 +1054,100 @@ void print_ds_banner(void) {
   fflush(stdout);
 }
 
-int is_systemd_rootfs(const char *path) {
-  if (!path)
-    return 0;
-
-  char buf[PATH_MAX];
+/* The symlink target of <rootfs>/sbin/init, or the start of the file when it
+ * is a real one (a wrapper script, or the init binary itself). 1 for a
+ * symlink, 0 for a file, -1 when there is neither. */
+static int read_sbin_init(const char *rootfs, char *buf, size_t size) {
+  char path[PATH_MAX];
+  if (snprintf(path, sizeof(path), "%s/sbin/init", rootfs) >= (int)sizeof(path))
+    return -1;
+  ssize_t len = readlink(path, buf, size - 1);
+  if (len >= 0) {
+    buf[len] = '\0';
+    return 1;
+  }
   struct stat st;
-  size_t path_len = strlen(path);
-
-  /* Standard systemd binary locations (not present on NixOS -- nix store). */
-  const char *check_paths[] = {"/lib/systemd/systemd",
-                               "/usr/lib/systemd/systemd", "/bin/systemd",
-                               "/usr/bin/systemd"};
-
-  for (size_t i = 0; i < sizeof(check_paths) / sizeof(check_paths[0]); i++) {
-    size_t check_len = strlen(check_paths[i]);
-    if (path_len + check_len >= sizeof(buf))
-      continue;
-
-    memcpy(buf, path, path_len);
-    memcpy(buf + path_len, check_paths[i], check_len + 1);
-    if (stat(buf, &st) == 0 && S_ISREG(st.st_mode)) {
-      return 1;
-    }
-  }
-
-  /* Fallback: /sbin/init symlink target or script contents.
-   * Works for both:
-   *   (a) a symlink -> .../systemd (classic distros, NixOS-systemd)
-   *   (b) a plain shell-script wrapper that exec's systemd (e.g. some
-   *       NixOS tarballs where /sbin/init is a real file, not a symlink)
-   * NOTE: do NOT treat /nix/store alone as evidence of systemd -- Nix
-   * can package any init system (finit, openrc, runit, ...).  We only
-   * return 1 when we can see the literal string "systemd". */
-  if (path_len + 12 <= sizeof(buf)) { /* 10 chars + '/' prefix + '\0' = 12 */
-    memcpy(buf, path, path_len);
-    memcpy(buf + path_len, "/sbin/init", 11);
-    char link_target[PATH_MAX];
-    ssize_t len = readlink(buf, link_target, sizeof(link_target) - 1);
-    if (len != -1) {
-      /* Case (a): symlink - check the target path for "systemd" */
-      link_target[len] = '\0';
-      if (strstr(link_target, "systemd"))
-        return 1;
-    } else {
-      /* Case (b): regular file - grep script body for "systemd" */
-      char script_buf[4096];
-      if (read_file(buf, script_buf, sizeof(script_buf)) > 0) {
-        if (strstr(script_buf, "systemd"))
-          return 1;
-      }
-    }
-  }
-
+  if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
+      read_file(path, buf, size) < 0)
+    return -1;
   return 0;
 }
 
-/* Probe the rootfs at `path` to identify its init system.
- * Uses the same stat+readlink pattern as is_systemd_rootfs. */
+/* A systemd binary where distros put it, or /sbin/init pointing at or
+ * wrapping one (NixOS keeps the binary in the store). /nix/store alone proves
+ * nothing: finit, openrc and runit live there too. */
+int is_systemd_rootfs(const char *path) {
+  static const char *const bins[] = {"/lib/systemd/systemd",
+                                     "/usr/lib/systemd/systemd", "/bin/systemd",
+                                     "/usr/bin/systemd"};
+  char buf[4096];
+  struct stat st;
+  if (!path)
+    return 0;
+  for (size_t i = 0; i < sizeof(bins) / sizeof(bins[0]); i++) {
+    if (snprintf(buf, sizeof(buf), "%s%s", path, bins[i]) >= (int)sizeof(buf))
+      continue;
+    if (stat(buf, &st) == 0 && S_ISREG(st.st_mode))
+      return 1;
+  }
+  return read_sbin_init(path, buf, sizeof(buf)) >= 0 &&
+         strstr(buf, "systemd") != NULL;
+}
+
 ds_init_type_t detect_container_init(const char *path) {
+  static const struct {
+    const char *bin;
+    ds_init_type_t type;
+  } inits[] = {
+      {"/sbin/procd", DS_INIT_PROCD},
+      {"/usr/sbin/procd", DS_INIT_PROCD},
+      {"/sbin/openrc-init", DS_INIT_OPENRC},
+      {"/usr/bin/openrc-init", DS_INIT_OPENRC},
+      {"/sbin/openrc", DS_INIT_OPENRC},
+      {"/sbin/runit", DS_INIT_RUNIT},
+      {"/usr/bin/runit", DS_INIT_RUNIT},
+      {"/bin/s6-svscan", DS_INIT_S6},
+      {"/usr/bin/s6-svscan", DS_INIT_S6},
+  };
   if (!path || path[0] == '\0')
     return DS_INIT_UNKNOWN;
-
-  char buf[PATH_MAX];
-  struct stat st;
-  size_t plen = strlen(path);
-
-  /* Helper: build "path + suffix" into buf, return 1 on success */
-#define PROBE_PATH(suffix)                                                     \
-  (plen + sizeof(suffix) - 1 < sizeof(buf) &&                                  \
-   (memcpy(buf, path, plen), memcpy(buf + plen, suffix, sizeof(suffix)), 1))
-
-  /* systemd -- reuse existing logic via is_systemd_rootfs */
   if (is_systemd_rootfs(path))
     return DS_INIT_SYSTEMD;
 
-  /* procd (OpenWrt) */
-  if ((PROBE_PATH("/sbin/procd") && stat(buf, &st) == 0 &&
-       S_ISREG(st.st_mode)) ||
-      (PROBE_PATH("/usr/sbin/procd") && stat(buf, &st) == 0 &&
-       S_ISREG(st.st_mode)))
-    return DS_INIT_PROCD;
-
-  /* openrc */
-  if ((PROBE_PATH("/sbin/openrc-init") && stat(buf, &st) == 0 &&
-       S_ISREG(st.st_mode)) ||
-      (PROBE_PATH("/usr/bin/openrc-init") && stat(buf, &st) == 0 &&
-       S_ISREG(st.st_mode)) ||
-      (PROBE_PATH("/sbin/openrc") && stat(buf, &st) == 0 &&
-       S_ISREG(st.st_mode)))
-    return DS_INIT_OPENRC;
-
-  /* runit */
-  if ((PROBE_PATH("/sbin/runit") && stat(buf, &st) == 0 &&
-       S_ISREG(st.st_mode)) ||
-      (PROBE_PATH("/usr/bin/runit") && stat(buf, &st) == 0 &&
-       S_ISREG(st.st_mode)))
-    return DS_INIT_RUNIT;
-
-  /* s6 */
-  if ((PROBE_PATH("/bin/s6-svscan") && stat(buf, &st) == 0 &&
-       S_ISREG(st.st_mode)) ||
-      (PROBE_PATH("/usr/bin/s6-svscan") && stat(buf, &st) == 0 &&
-       S_ISREG(st.st_mode)))
-    return DS_INIT_S6;
-
-  /* sysvinit: /sbin/init is a regular binary, or symlink points to sysvinit.
-   * If /sbin/init is a real file (not a symlink), grep its content before
-   * declaring sysvinit -- Nix wrapper scripts must not be misclassified.
-   * NOTE: /nix/store presence does NOT imply systemd; finit, openrc, etc.
-   * can live there too.  Only match on the literal init-system name. */
-  if (PROBE_PATH("/sbin/init")) {
-    char target[PATH_MAX];
-    ssize_t len = readlink(buf, target, sizeof(target) - 1);
-    if (len == -1) {
-      /* not a symlink -> stat and, if regular, inspect script body */
-      if (stat(buf, &st) == 0 && S_ISREG(st.st_mode)) {
-        char script_buf[4096];
-        if (read_file(buf, script_buf, sizeof(script_buf)) > 0) {
-          if (strstr(script_buf, "systemd"))
-            return DS_INIT_SYSTEMD;
-          if (strstr(script_buf, "busybox"))
-            return DS_INIT_BUSYBOX;
-          /* Any other Nix wrapper (finit, openrc, ...) falls through to
-           * DS_INIT_UNKNOWN so the caller can handle it gracefully. */
-          if (strstr(script_buf, "/nix/store"))
-            return DS_INIT_UNKNOWN;
-        }
-        return DS_INIT_SYSVINIT;
-      }
-    } else {
-      target[len] = '\0';
-      if (strstr(target, "busybox"))
-        return DS_INIT_BUSYBOX;
-      if (strstr(target, "sysvinit") || strstr(target, "init.sysv"))
-        return DS_INIT_SYSVINIT;
-    }
+  char buf[4096];
+  struct stat st;
+  for (size_t i = 0; i < sizeof(inits) / sizeof(inits[0]); i++) {
+    if (snprintf(buf, sizeof(buf), "%s%s", path, inits[i].bin) >=
+        (int)sizeof(buf))
+      continue;
+    if (stat(buf, &st) == 0 && S_ISREG(st.st_mode))
+      return inits[i].type;
   }
 
-#undef PROBE_PATH
-
-  return DS_INIT_UNKNOWN;
+  /* The rest are told apart by /sbin/init itself. */
+  int kind = read_sbin_init(path, buf, sizeof(buf));
+  if (kind < 0)
+    return DS_INIT_UNKNOWN;
+  if (strstr(buf, "busybox"))
+    return DS_INIT_BUSYBOX;
+  if (kind == 1)
+    return strstr(buf, "sysvinit") || strstr(buf, "init.sysv")
+               ? DS_INIT_SYSVINIT
+               : DS_INIT_UNKNOWN;
+  /* A real file: a Nix wrapper for some other init stays unknown so the
+   * caller can cope, anything else is sysvinit's own binary. */
+  return strstr(buf, "/nix/store") ? DS_INIT_UNKNOWN : DS_INIT_SYSVINIT;
 }
 
 int get_user_shell(const char *user, char *shell_buf, size_t size) {
-  if (!user || user[0] == '\0' || !shell_buf || size == 0)
+  /* Runs inside the container's mount namespace, so musl's getpwnam reads the
+   * guest's /etc/passwd, and asks a guest nscd only for a user that file does
+   * not have. */
+  struct passwd *pw = user && user[0] ? getpwnam(user) : NULL;
+  if (!pw || !pw->pw_shell || !pw->pw_shell[0] || !shell_buf || !size)
     return -1;
-
-  FILE *f = fopen("/etc/passwd", "re");
-  if (!f)
-    return -1;
-
-  char line[1024];
-  int found = 0;
-  while (fgets(line, sizeof(line), f)) {
-    /* Format: user:pw:uid:gid:gecos:home:shell */
-    char line_copy[1024];
-    strncpy(line_copy, line, sizeof(line_copy) - 1);
-    line_copy[sizeof(line_copy) - 1] = '\0';
-
-    char *saveptr;
-    char *name = strtok_r(line_copy, ":", &saveptr);
-    if (!name || strcmp(name, user) != 0)
-      continue;
-
-    /* Skip 5 fields to reach the shell (field 7) */
-    for (int i = 0; i < 5; i++) {
-      if (!strtok_r(NULL, ":", &saveptr))
-        break;
-    }
-    char *shell = strtok_r(NULL, ":\n", &saveptr);
-
-    if (shell) {
-      safe_strncpy(shell_buf, shell, size);
-      found = 1;
-      break;
-    }
-  }
-
-  fclose(f);
-  return found ? 0 : -1;
+  safe_strncpy(shell_buf, pw->pw_shell, size);
+  return 0;
 }
 
 int get_selinux_context(const char *path, char *buf, size_t size) {
@@ -1479,28 +1234,6 @@ int set_selinux_context(const char *path, const char *context) {
   return 0;
 }
 
-int copy_file(const char *src, const char *dst) {
-  FILE *in = fopen(src, "re");
-  if (!in)
-    return -1;
-  FILE *out = fopen(dst, "we");
-  if (!out) {
-    fclose(in);
-    return -1;
-  }
-  char buf[4096];
-  size_t n;
-  while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
-    if (fwrite(buf, 1, n, out) != n) {
-      fclose(in);
-      fclose(out);
-      return -1;
-    }
-  fclose(in);
-  fclose(out);
-  return 0;
-}
-
 /* USER_HZ as the kernel announces it in the auxv. musl hardcodes
  * sysconf(_SC_CLK_TCK) to 100 and never looks, and a vendor kernel built
  * with USER_HZ=250 then puts every /proc tick count off by 2.5x. */
@@ -1509,48 +1242,39 @@ long ds_clk_tck(void) {
   return hz > 0 ? hz : 100;
 }
 
-/* Seconds since container init started: field 22 (starttime) of
- * /proc/<pid>/stat subtracted from /proc/uptime. */
+/* Field n of /proc/<pid>/stat, numbered as proc(5) does, read into buf, or
+ * NULL. Counted from the last ')' because comm may hold spaces: the
+ * Termux:X11 server's is "termux-x11 com.", which threw a plain whitespace
+ * split off by one. */
+const char *proc_stat_field(pid_t pid, int n, char *buf, size_t size) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+  if (read_file(path, buf, size) < 0)
+    return NULL;
+  const char *p = strrchr(buf, ')');
+  for (int field = 2; p && field < n; field++)
+    p = strchr(p + 1, ' ');
+  return p ? p + 1 : NULL;
+}
+
+/* Field 22: when the process started, in clock ticks since boot, or 0. */
+unsigned long long proc_starttime(pid_t pid) {
+  char buf[1024];
+  const char *f = proc_stat_field(pid, 22, buf, sizeof(buf));
+  return f ? strtoull(f, NULL, 10) : 0;
+}
+
+/* Seconds since the container's init started, or -1. Its start is in ticks
+ * since boot, the CLOCK_BOOTTIME reference. */
 long ds_get_container_uptime(pid_t pid) {
-  if (pid <= 0)
-    return -1;
-
-  long clk_tck = ds_clk_tck();
-  if (clk_tck <= 0)
-    clk_tck = 100;
-
-  char stat_path[PATH_MAX];
-  snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", (int)pid);
-
-  FILE *f = fopen(stat_path, "r");
-  if (!f)
-    return -1;
-
-  unsigned long long start_ticks = 0;
-  /* starttime is the 22nd field */
-  for (int i = 1; i <= 21; i++) {
-    if (fscanf(f, "%*s") == EOF)
-      break;
-  }
-  if (fscanf(f, "%llu", &start_ticks) != 1)
-    start_ticks = 0;
-  fclose(f);
-
+  unsigned long long start_ticks = pid > 0 ? proc_starttime(pid) : 0;
   if (start_ticks == 0)
     return -1;
-
-  f = fopen("/proc/uptime", "r");
-  if (!f)
-    return -1;
-
-  double host_uptime_sec = 0.0;
-  if (fscanf(f, "%lf", &host_uptime_sec) != 1)
-    host_uptime_sec = 0.0;
-  fclose(f);
-
-  long uptime_sec =
-      (long)(host_uptime_sec - (double)start_ticks / (double)clk_tck);
-  return (uptime_sec < 0) ? 0 : uptime_sec;
+  struct timespec now;
+  clock_gettime(CLOCK_BOOTTIME, &now);
+  double up = (double)now.tv_sec + (double)now.tv_nsec / 1e9 -
+              (double)start_ticks / (double)ds_clk_tck();
+  return up < 0 ? 0 : (long)up;
 }
 
 void ds_format_uptime(long uptime_sec, char *buf, size_t size) {
@@ -1731,166 +1455,6 @@ void ds_format_size(long long bytes, char *buf, size_t sz) {
   snprintf(buf, sz, "%.2f %s", d, units[u]);
 }
 
-static uint64_t ds_socketd_hton64(uint64_t value) {
-#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
-  return value;
-#else
-  return ((uint64_t)htonl((uint32_t)(value & 0xffffffffULL)) << 32) |
-         (uint64_t)htonl((uint32_t)(value >> 32));
-#endif
-}
-
-static int ds_socketd_build_core_event_path(char *path, size_t path_size) {
-  if (!path || path_size == 0)
-    return -1;
-
-  int r =
-      snprintf(path, path_size, "%.4076s/socketd-events.bin", get_logs_dir());
-  return (r > 0 && (size_t)r < path_size) ? 0 : -1;
-}
-
-static void ds_socketd_trim_core_event_file(const char *path) {
-  if (!path || path[0] == '\0')
-    return;
-
-  enum {
-    kSoftCapRecords = 128,
-    kRetainRecords = 64,
-  };
-
-  const size_t record_size = sizeof(struct ds_socketd_core_event_record);
-  const off_t soft_cap_bytes = (off_t)(kSoftCapRecords * record_size);
-  const off_t retain_bytes = (off_t)(kRetainRecords * record_size);
-
-  int fd = open(path, O_RDWR | O_CLOEXEC);
-  if (fd < 0)
-    return;
-
-  struct stat st;
-  if (fstat(fd, &st) < 0 || st.st_size <= soft_cap_bytes) {
-    close(fd);
-    return;
-  }
-
-  off_t complete_records = st.st_size / (off_t)record_size;
-  if (complete_records <= kRetainRecords) {
-    close(fd);
-    return;
-  }
-
-  off_t first_kept_record = complete_records - kRetainRecords;
-  off_t read_offset = first_kept_record * (off_t)record_size;
-
-  if (lseek(fd, read_offset, SEEK_SET) < 0) {
-    close(fd);
-    return;
-  }
-
-  struct ds_socketd_core_event_record keep[kRetainRecords];
-  memset(keep, 0, sizeof(keep));
-
-  size_t bytes_wanted = (size_t)retain_bytes;
-  size_t bytes_read = 0;
-
-  while (bytes_read < bytes_wanted) {
-    ssize_t n =
-        read(fd, (uint8_t *)keep + bytes_read, bytes_wanted - bytes_read);
-    if (n < 0) {
-      if (errno == EINTR)
-        continue;
-      close(fd);
-      return;
-    }
-
-    if (n == 0)
-      break;
-
-    bytes_read += (size_t)n;
-  }
-
-  bytes_read -= bytes_read % record_size;
-  if (bytes_read == 0) {
-    close(fd);
-    return;
-  }
-
-  if (ftruncate(fd, 0) < 0 || lseek(fd, 0, SEEK_SET) < 0) {
-    close(fd);
-    return;
-  }
-
-  if (write_all(fd, keep, bytes_read) != (ssize_t)bytes_read) {
-    close(fd);
-    return;
-  }
-
-  close(fd);
-}
-
-void ds_socketd_record_core_event(const char *action,
-                                  const char *container_name,
-                                  const char *uuid) {
-#if !defined(DS_ENABLE_SOCKETD_BACKEND) || DS_ENABLE_SOCKETD_BACKEND != 1
-  (void)action;
-  (void)container_name;
-  (void)uuid;
-  return;
-#endif
-
-  struct timespec ts;
-  if (clock_gettime(CLOCK_REALTIME, &ts) < 0)
-    return;
-
-  mkdir_p(get_logs_dir(), 0755);
-
-  char event_path[PATH_MAX];
-  if (ds_socketd_build_core_event_path(event_path, sizeof(event_path)) < 0)
-    return;
-
-  struct ds_socketd_core_event_record record;
-  memset(&record, 0, sizeof(record));
-
-  uint64_t time_seconds = (uint64_t)ts.tv_sec;
-  uint64_t time_nano =
-      (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-
-  record.time_be = (int64_t)ds_socketd_hton64(time_seconds);
-  record.time_nano_be = (int64_t)ds_socketd_hton64(time_nano);
-
-  safe_strncpy(record.type, "container", sizeof(record.type));
-  safe_strncpy(record.action, action, sizeof(record.action));
-  safe_strncpy(record.actor_id, uuid, sizeof(record.actor_id));
-  safe_strncpy(record.actor_name, container_name, sizeof(record.actor_name));
-
-  int fd = open(event_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-  if (fd < 0)
-    return;
-
-  if (write_all(fd, &record, sizeof(record)) != (ssize_t)sizeof(record)) {
-    close(fd);
-    return;
-  }
-
-  struct stat st;
-  int should_trim = 0;
-  if (fstat(fd, &st) == 0) {
-    off_t soft_cap = (off_t)(128 * sizeof(struct ds_socketd_core_event_record));
-    should_trim = st.st_size > soft_cap;
-  }
-
-  close(fd);
-
-  /*
-   * CONCERN(socketd-events):
-   * Event compaction is best-effort and intentionally unsynchronized. The
-   * file is small and local; a future hardening pass can add advisory locking
-   * if multiple event writers become materially concurrent in practice.
-   */
-
-  if (should_trim)
-    ds_socketd_trim_core_event_file(event_path);
-}
-
 /*
  * count_folders : function to count the number of folders in the passed path
  * and return the number of folder it can be used the get the total number of
@@ -1943,14 +1507,6 @@ int parse_and_validate_names(const char *optarg, char *out_buf,
 }
 
 /* Init an iter_cfg suitable for per-container dispatch. */
-static void init_iter_cfg(struct ds_config *c, const char *prog_name) {
-  memset(c, 0, sizeof(*c));
-  c->net_ready_pipe[0] = c->net_ready_pipe[1] = -1;
-  c->net_done_pipe[0] = c->net_done_pipe[1] = -1;
-  if (prog_name)
-    safe_strncpy(c->prog_name, prog_name, sizeof(c->prog_name));
-}
-
 int ds_multi_stop(const char *raw_names) {
   char tmp[4096];
   snprintf(tmp, sizeof(tmp), "%s", raw_names);
@@ -1958,7 +1514,7 @@ int ds_multi_stop(const char *raw_names) {
   char *sp, *tok = strtok_r(tmp, ",", &sp);
   while (tok) {
     struct ds_config c;
-    init_iter_cfg(&c, NULL);
+    ds_config_init(&c);
     safe_strncpy(c.container_name, tok, sizeof(c.container_name));
     /* ds_log() keys the log file by this global, not by the config it is
      * handed, so point it at the container being stopped. */
@@ -1973,6 +1529,20 @@ int ds_multi_stop(const char *raw_names) {
 
 /* Shell metacharacters that must never appear in a flag token */
 static const char ds_shell_metachars[] = "$`;&|><(){}\\";
+
+/* Append c to a growing token, doubling its buffer as needed. */
+static int push(char **tok, size_t *len, size_t *cap, char c) {
+  if (*len + 1 >= *cap) {
+    size_t ncap = *cap ? *cap * 2 : 64;
+    char *tmp = realloc(*tok, ncap);
+    if (!tmp)
+      return -1;
+    *tok = tmp;
+    *cap = ncap;
+  }
+  (*tok)[(*len)++] = c;
+  return 0;
+}
 
 /*
  * Split a flags string into an argv array suitable for appending to execv.
@@ -1997,86 +1567,35 @@ int ds_split_flags(const char *str, char ***out_argv, int *out_argc) {
   const char *p = str;
 
   while (*p) {
-    /* Skip whitespace between tokens */
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+    while (isspace((unsigned char)*p))
       p++;
     if (!*p)
       break;
 
-    /* Accumulate one token (handles single/double quoting) */
+    /* One token; a quoted run copies literally up to its closing quote. */
     char *tok = NULL;
     size_t tok_len = 0, tok_cap = 0;
-
-    while (*p && !(*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) {
-      char c;
-      if (*p == '\'') {
-        /* Single-quoted: copy literally until closing ' */
-        p++;
-        while (*p && *p != '\'') {
-          c = *p++;
-          if (tok_len + 1 >= tok_cap) {
-            tok_cap = tok_cap ? tok_cap * 2 : 64;
-            char *tmp = realloc(tok, tok_cap);
-            if (!tmp) {
-              free(tok);
-              goto oom;
-            }
-            tok = tmp;
-          }
-          tok[tok_len++] = c;
-        }
-        if (*p == '\'')
-          p++;
-      } else if (*p == '"') {
-        /* Double-quoted: copy literally until closing " */
-        p++;
-        while (*p && *p != '"') {
-          c = *p++;
-          if (tok_len + 1 >= tok_cap) {
-            tok_cap = tok_cap ? tok_cap * 2 : 64;
-            char *tmp = realloc(tok, tok_cap);
-            if (!tmp) {
-              free(tok);
-              goto oom;
-            }
-            tok = tmp;
-          }
-          tok[tok_len++] = c;
-        }
-        if (*p == '"')
-          p++;
-      } else {
-        c = *p++;
-        if (tok_len + 1 >= tok_cap) {
-          tok_cap = tok_cap ? tok_cap * 2 : 64;
-          char *tmp = realloc(tok, tok_cap);
-          if (!tmp) {
+    while (*p && !isspace((unsigned char)*p)) {
+      char q = (*p == '\'' || *p == '"') ? *p++ : 0;
+      if (q) {
+        while (*p && *p != q)
+          if (push(&tok, &tok_len, &tok_cap, *p++) < 0) {
             free(tok);
             goto oom;
           }
-          tok = tmp;
-        }
-        tok[tok_len++] = c;
+        if (*p == q)
+          p++;
+      } else if (push(&tok, &tok_len, &tok_cap, *p++) < 0) {
+        free(tok);
+        goto oom;
       }
     }
-
     if (!tok_len) {
       free(tok);
       continue;
     }
+    tok[tok_len] = '\0'; /* push always leaves room for it */
 
-    /* NUL-terminate */
-    if (tok_len + 1 > tok_cap) {
-      char *tmp = realloc(tok, tok_len + 1);
-      if (!tmp) {
-        free(tok);
-        goto oom;
-      }
-      tok = tmp;
-    }
-    tok[tok_len] = '\0';
-
-    /* Reject shell metacharacters */
     if (strpbrk(tok, ds_shell_metachars)) {
       ds_error("flags: rejected token with shell metachar: %s", tok);
       free(tok);
@@ -2084,7 +1603,6 @@ int ds_split_flags(const char *str, char ***out_argv, int *out_argc) {
       return -1;
     }
 
-    /* Grow argv array */
     if (count >= cap) {
       int new_cap = cap ? cap * 2 : 8;
       char **tmp = realloc(argv, (size_t)(new_cap + 1) * sizeof(char *));
@@ -2123,29 +1641,40 @@ void ds_free_split_flags(char **argv, int argc) {
  * Shared building blocks for x11.c, virgl-android.c, pulseaudio-android.c,
  * monitor.c, and daemon.c.  Generic (not Android-specific). */
 
-/* Read a daemon PID from <pids_dir>/<filename>; returns pid or -1. */
-pid_t ds_daemon_read_pid(const char *filename) {
+/* A daemon pidfile is "<pid> <starttime>\n<flags>". Pids/ survives a device
+ * reboot, and by then the pid can belong to any process, which a stop would
+ * SIGKILL. The starttime ties it to the process that was spawned. A file
+ * written before the starttime existed has none, so *legacy is set and the
+ * pid is trusted as it always was. The file lands in buf for the flags. */
+static pid_t daemon_pidfile_load(const char *filename, char *buf, size_t size,
+                                 int *legacy) {
   char path[PATH_MAX];
   snprintf(path, sizeof(path), "%s/%s", get_pids_dir(), filename);
-
-  char buf[32] = {0};
-  int fd = open(path, O_RDONLY | O_CLOEXEC);
-  if (fd < 0)
+  if (read_file(path, buf, size) < 0)
     return -1;
-  ssize_t n = read(fd, buf, sizeof(buf) - 1);
-  close(fd);
-
-  if (n <= 0)
+  char *end;
+  pid_t pid = (pid_t)strtol(buf, &end, 10);
+  unsigned long long start = *end == ' ' ? strtoull(end + 1, NULL, 10) : 0;
+  if (legacy)
+    *legacy = start == 0;
+  if (pid <= 1 || kill(pid, 0) != 0)
     return -1;
-  pid_t pid = (pid_t)atoi(buf);
-  return (pid > 1 && kill(pid, 0) == 0) ? pid : -1;
+  return (start == 0 || proc_starttime(pid) == start) ? pid : -1;
 }
 
-/* Write PID to <pids_dir>/<filename>. */
-void ds_daemon_write_pid(const char *filename, pid_t pid) {
-  char path[PATH_MAX], buf[32];
+/* Read a daemon PID from <pids_dir>/<filename>; returns pid or -1. */
+pid_t ds_daemon_read_pid(const char *filename) {
+  char buf[4096];
+  return daemon_pidfile_load(filename, buf, sizeof(buf), NULL);
+}
+
+/* Write PID to <pids_dir>/<filename>, with the flags the server was spawned
+ * with for ds_global_daemon_reuse() to compare. */
+void ds_daemon_write_pid(const char *filename, pid_t pid, const char *flags) {
+  char path[PATH_MAX], buf[4096];
   snprintf(path, sizeof(path), "%s/%s", get_pids_dir(), filename);
-  snprintf(buf, sizeof(buf), "%d", (int)pid);
+  snprintf(buf, sizeof(buf), "%d %llu\n%s", (int)pid, proc_starttime(pid),
+           flags ? flags : "");
   write_file_atomic(path, buf);
 }
 
@@ -2159,6 +1688,23 @@ void ds_daemon_remove_pid(const char *filename) {
 /* Resolve a cached pid or fall back to the pidfile. */
 pid_t ds_resolve_daemon_pid(pid_t cached, const char *pidfile) {
   return cached > 0 ? cached : ds_daemon_read_pid(pidfile);
+}
+
+static void daemon_kill(pid_t pid, const char *pidfile, const char *sock_path,
+                        const char *tag) {
+  if (pid > 0) {
+    ds_log("%s terminating (PID %d)...", tag, (int)pid);
+    kill(pid, SIGTERM);
+    for (int i = 0; i < 10 && kill(pid, 0) == 0; i++)
+      usleep(100000);
+    if (kill(pid, 0) == 0) {
+      kill(pid, SIGKILL);
+      waitpid(pid, NULL, 0);
+    }
+  }
+  ds_daemon_remove_pid(pidfile);
+  if (sock_path)
+    unlink(sock_path);
 }
 
 /*
@@ -2183,22 +1729,40 @@ void ds_global_daemon_stop(int (*check_fn)(void), pid_t cached_pid,
   }
 
   pid_t pid = ds_resolve_daemon_pid(cached_pid, pidfile);
-  if (pid > 0) {
-    ds_log("%s terminating (PID %d)...", tag, (int)pid);
-    kill(pid, SIGTERM);
-    for (int i = 0; i < 10 && kill(pid, 0) == 0; i++)
-      usleep(100000);
-    if (kill(pid, 0) == 0) {
-      kill(pid, SIGKILL);
-      waitpid(pid, NULL, 0);
-    }
-    if (pid_out)
-      *pid_out = 0;
-  }
+  if (pid > 0 && pid_out)
+    *pid_out = 0;
+  daemon_kill(pid, pidfile, sock_path, tag);
+}
 
-  ds_daemon_remove_pid(pidfile);
-  if (sock_path)
-    unlink(sock_path);
+/* A global server's flags are fixed when it spawns, and a restart keeps the
+ * server alive for the next boot, so reusing it blindly meant edited extra
+ * flags never reached it. Reuse it only while its flags match this config's.
+ * A mismatched server is replaced unless another running container shares
+ * it. A legacy pidfile records neither flags nor identity, so that server is
+ * reused as before and the next full stop moves it to the new format.
+ * Returns the pid to reuse, or -1 when the caller should spawn. */
+pid_t ds_global_daemon_reuse(int (*check_fn)(void), const char *pidfile,
+                             const char *flags, const char *sock_path,
+                             const char *tag) {
+  char buf[4096];
+  int legacy;
+  pid_t pid = daemon_pidfile_load(pidfile, buf, sizeof(buf), &legacy);
+  if (pid <= 0)
+    return -1;
+
+  const char *nl = strchr(buf, '\n');
+  if (legacy || strcmp(nl ? nl + 1 : "", flags ? flags : "") == 0)
+    return pid;
+
+  if (check_fn() == 1) {
+    ds_warn("%s shared with another running container, new extra flags apply "
+            "once it stops",
+            tag);
+    return pid;
+  }
+  ds_log("%s extra flags changed, restarting the server", tag);
+  daemon_kill(pid, pidfile, sock_path, tag);
+  return -1;
 }
 
 /* pthread_create for a helper thread that must never receive signals.

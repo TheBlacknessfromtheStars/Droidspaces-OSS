@@ -1,6 +1,7 @@
 package com.droidspaces.app.ui.screen
 
 import com.droidspaces.app.ui.component.DsDialog
+import com.droidspaces.app.ui.component.ConfirmPhraseField
 import com.droidspaces.app.ui.component.DsTextFieldDefaults
 
 import android.net.Uri
@@ -34,6 +35,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.withStyle
@@ -41,15 +43,13 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.droidspaces.app.ui.component.DsSnackbarHost
 import com.droidspaces.app.ui.util.ProgressDialog
+import com.droidspaces.app.ui.util.FullScreenLoading
 import com.droidspaces.app.ui.util.ErrorLogsDialog
-import com.droidspaces.app.ui.util.LoadingIndicator
-import com.droidspaces.app.ui.util.LoadingSize
 import com.droidspaces.app.ui.util.AnimatedListEntry
 import com.droidspaces.app.ui.util.rememberAnimatedEntries
 import com.droidspaces.app.ui.util.showError
 import com.droidspaces.app.ui.util.showSuccess
 import androidx.compose.material3.SnackbarHostState
-import androidx.compose.material3.SnackbarDuration
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -71,7 +71,7 @@ import com.droidspaces.app.ui.component.RootfsRepoSheet
 import com.droidspaces.app.ui.viewmodel.ContainerViewModel
 import com.droidspaces.app.ui.viewmodel.ContainerOperationsViewModel
 import com.droidspaces.app.ui.viewmodel.UninstallState
-import com.droidspaces.app.ui.viewmodel.SparseOperation
+import com.droidspaces.app.ui.viewmodel.SparseOp
 import androidx.compose.foundation.clickable
 import androidx.compose.ui.draw.clip
 import com.droidspaces.app.R
@@ -104,7 +104,7 @@ fun ContainersScreen(
 
     // UI-only state (dialog triggers / pending pickers).
     var showUninstallConfirmation by remember { mutableStateOf<ContainerInfo?>(null) }
-    var pendingSparseOperation by remember { mutableStateOf<SparseOperation?>(null) }
+    var pendingSparseOperation by remember { mutableStateOf<Pair<ContainerInfo, SparseOp>?>(null) }
     var pendingExportContainer by remember { mutableStateOf<ContainerInfo?>(null) }
     var pendingExportEnv by remember { mutableStateOf(false) }
     var askExportEnv by remember { mutableStateOf<ContainerInfo?>(null) }
@@ -170,12 +170,7 @@ fun ContainersScreen(
             }
             entries.isEmpty() -> {
                 if (containerViewModel.isRefreshing) {
-                    Box(
-                        modifier = Modifier.fillMaxSize().padding(bottom = bottomBarInset),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        LoadingIndicator(size = LoadingSize.Large)
-                    }
+                    FullScreenLoading(modifier = Modifier.padding(bottom = bottomBarInset))
                 } else {
                     EmptyState(
                         icon = DsIcons.Logo,
@@ -208,6 +203,14 @@ fun ContainersScreen(
                         val container = entry.item
                         // Console button is always visible - logs persist for each container
                         val isRunning = opsViewModel.runningOperationContainer == container.name
+                        fun run(op: String) = scope.launch {
+                            opsViewModel.executeOperation(
+                                container, op,
+                                onRefresh = { containerViewModel.refresh() },
+                                onClearUsage = { systemStatsViewModel.clearContainerUsage(it) },
+                                onFailureSnackbar = { scope.showError(snackbarHostState, it) }
+                            )
+                        }
 
                         AnimatedListEntry(entry) {
                             ContainerCard(
@@ -221,36 +224,9 @@ fun ContainersScreen(
                                  onShowLogs = {
                                     opsViewModel.showLogViewerFor = container.name
                                 },
-                                onStart = {
-                                    scope.launch {
-                                        opsViewModel.executeOperation(
-                                            container, "start",
-                                            onRefresh = { containerViewModel.refresh() },
-                                            onClearUsage = { systemStatsViewModel.clearContainerUsage(it) },
-                                            onFailureSnackbar = { msg -> scope.launch { snackbarHostState.showSnackbar(msg, duration = SnackbarDuration.Long) } }
-                                        )
-                                    }
-                                },
-                                onStop = {
-                                    scope.launch {
-                                        opsViewModel.executeOperation(
-                                            container, "stop",
-                                            onRefresh = { containerViewModel.refresh() },
-                                            onClearUsage = { systemStatsViewModel.clearContainerUsage(it) },
-                                            onFailureSnackbar = { msg -> scope.launch { snackbarHostState.showSnackbar(msg, duration = SnackbarDuration.Long) } }
-                                        )
-                                    }
-                                },
-                                onRestart = {
-                                    scope.launch {
-                                        opsViewModel.executeOperation(
-                                            container, "restart",
-                                            onRefresh = { containerViewModel.refresh() },
-                                            onClearUsage = { systemStatsViewModel.clearContainerUsage(it) },
-                                            onFailureSnackbar = { msg -> scope.launch { snackbarHostState.showSnackbar(msg, duration = SnackbarDuration.Long) } }
-                                        )
-                                    }
-                                },
+                                onStart = { run("start") },
+                                onStop = { run("stop") },
+                                onRestart = { run("restart") },
                                 onEdit = {
                                     onExpandedContainerNameChange(null)
                                     onNavigateToEditContainer(container.name)
@@ -264,11 +240,11 @@ fun ContainersScreen(
                                 },
                                 onMigrate = {
                                     onExpandedContainerNameChange(null)
-                                    pendingSparseOperation = SparseOperation.Migrate(container)
+                                    pendingSparseOperation = container to SparseOp.MIGRATE
                                 },
                                 onResize = {
                                     onExpandedContainerNameChange(null)
-                                    pendingSparseOperation = SparseOperation.Resize(container)
+                                    pendingSparseOperation = container to SparseOp.RESIZE
                                 },
                                 onExport = {
                                     onExpandedContainerNameChange(null)
@@ -446,30 +422,25 @@ fun ContainersScreen(
         }
 
         // Sparse operation size dialog
-        pendingSparseOperation?.let { op ->
-            val container = when (op) {
-                is SparseOperation.Migrate -> op.container
-                is SparseOperation.Resize -> op.container
-            }
-
+        pendingSparseOperation?.let { (container, op) ->
             SparseSizeDialog(
                 title = context.getString(
-                    if (op is SparseOperation.Migrate) R.string.migrate_dialog_title
+                    if (op == SparseOp.MIGRATE) R.string.migrate_dialog_title
                     else R.string.resize_dialog_title
                 ),
                 message = context.getString(
-                    if (op is SparseOperation.Migrate) R.string.migrate_dialog_message
+                    if (op == SparseOp.MIGRATE) R.string.migrate_dialog_message
                     else R.string.resize_dialog_message,
                     container.name
                 ),
                 initialSize = container.sparseImageSizeGB ?: 8,
                 // Only a resize can be a no-op: a migrate has no image yet, so
                 // picking the default size there is a legitimate choice.
-                currentSize = if (op is SparseOperation.Resize) container.sparseImageSizeGB else null,
+                currentSize = if (op == SparseOp.RESIZE) container.sparseImageSizeGB else null,
                 onConfirm = { size ->
                     pendingSparseOperation = null
                     scope.launch {
-                        opsViewModel.executeSparseOperation(op, size, onRefresh = { containerViewModel.refresh() })
+                        opsViewModel.executeSparseOperation(container, op, size, onRefresh = { containerViewModel.refresh() })
                     }
                 },
                 onDismiss = { pendingSparseOperation = null }
@@ -593,28 +564,15 @@ private fun UninstallConfirmationDialog(
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(
-                    text = context.getString(R.string.type_container_name_to_confirm),
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.Bold
-                )
-                OutlinedTextField(
-                    value = confirmText,
-                    onValueChange = { confirmText = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    placeholder = { Text(containerName) },
-                    singleLine = true,
-                    isError = confirmText.isNotEmpty() && !isConfirmed,
-                    shape = RoundedCornerShape(16.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
-                        focusedBorderColor = MaterialTheme.colorScheme.error.copy(alpha = 0.8f),
-                        unfocusedContainerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.5f),
-                        focusedContainerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)
-                    )
-                )
-            }
+            ConfirmPhraseField(
+                value = confirmText,
+                onValueChange = { confirmText = it },
+                isError = confirmText.isNotEmpty() && !isConfirmed,
+                instruction = context.getString(R.string.type_container_name_to_confirm),
+                phrase = containerName,
+                // A container name is case-sensitive; the keyboard must not upper-case it.
+                capitalization = KeyboardCapitalization.None
+            )
     }
     }
 
